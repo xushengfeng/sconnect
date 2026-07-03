@@ -1,5 +1,5 @@
 {
-    "name": "@myde/remote-connect",
+    "name": "myde-remote-connect",
     "version": "0.0.1",
     "description": "Secure remote connection module with PAKE pairing and Noise IK handshake",
     "type": "module",
