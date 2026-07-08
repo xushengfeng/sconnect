@@ -47,8 +47,7 @@
     "license": "AGPL-3.0-only",
     "repository": {
         "type": "git",
-        "url": "https://github.com/xushengfeng/myde/",
-        "directory": "src/remote_connect"
+        "url": "https://github.com/xushengfeng/sconnect"
     },
     "devDependencies": {
         "biome": "^0.3.3",
