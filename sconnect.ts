@@ -697,13 +697,20 @@ export class SConnect implements SecureChannel {
 		this.typeMessageResolvers.set(type, {
 			resolve: (data: Uint8Array) => {
 				this.typeMessageResolvers.delete(type);
+				clearTimeout(timer);
 				p.resolve(data);
 			},
 			reject: (err: Error) => {
 				this.typeMessageResolvers.delete(type);
+				clearTimeout(timer);
 				p.reject(err);
 			},
 		});
+		const timer = setTimeout(() => {
+			this.typeMessageResolvers.delete(type);
+			p.reject(new SConnectError("TIMEOUT", `Timeout waiting for message type ${type}`));
+		}, this.options.handshakeTimeout);
+		this.activeTimers.add(timer);
 		return p.promise;
 	}
 
