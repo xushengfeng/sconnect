@@ -209,6 +209,49 @@ export class SConnect implements SecureChannel {
 		}
 	}
 
+	private handleConnectRequest(payload: Uint8Array): void {
+		const senderIdLength = new DataView(
+			payload.buffer,
+			payload.byteOffset,
+		).getUint16(0);
+		const senderId = new TextDecoder().decode(
+			payload.subarray(2, 2 + senderIdLength),
+		);
+
+		if (senderId !== this.remoteId) {
+			this.sendHandshakeMessage(MSG_CONNECT_REJECT, new Uint8Array(0)).catch(
+				() => {},
+			);
+			return;
+		}
+
+		if (!this.connectLimiter.canExecute()) {
+			// todo 提示被频繁占用
+			this.signalAdapter
+				.send(new Uint8Array([MSG_CONNECT_REJECT]))
+				.catch(() => {});
+			return;
+		}
+
+		const request: ConnectRequest = {
+			remoteDeviceId: senderId,
+			accept: (credential: Credential): Promise<ConnectResult> => {
+				this.setState("Handshaking", "connect-response");
+				this.sendHandshakeMessage(MSG_CONNECT_ACCEPT, new Uint8Array(0)).catch(
+					() => {},
+				);
+				return this.performIKResponder(credential);
+			},
+			reject: () => {
+				this.sendHandshakeMessage(MSG_CONNECT_REJECT, new Uint8Array(0)).catch(
+					() => {},
+				);
+			},
+		};
+
+		this.emit("connectRequest", request);
+	}
+
 	// ================= 配对 =================
 
 	updatePIN(): string {
@@ -320,6 +363,116 @@ export class SConnect implements SecureChannel {
 		this.sendPairRequest(credential).catch(rejectPairing);
 
 		return { pin, inputOtherPin, waitForPairing };
+	}
+
+	private handlePairRequest(payload: Uint8Array): void {
+		if (!this.pairLimiter.canExecute()) {
+			// 考虑到id都是临时可变的，无法区分真实设备，所以全部限制
+			// todo 中间信息攻击，比如useyourpin dos，或者其它，需要状态机限制顺序和个数
+			// todo 提示被频繁占用
+			// todo 其他可能的配对方式
+			this.signalAdapter
+				.send(new Uint8Array([MSG_PAIR_REJECT]))
+				.catch(() => {}); // todo 区分拒绝原因
+			return;
+		}
+
+		const senderIdLength = new DataView(
+			payload.buffer,
+			payload.byteOffset,
+		).getUint16(0);
+		const senderId = new TextDecoder().decode(
+			payload.subarray(2, 2 + senderIdLength),
+		);
+
+		let pinAttempts = 0;
+		let savedPin: string | null = null;
+		let pairingStarted = false;
+		let waitingForPairing = false;
+
+		const {
+			promise: pairingPromise,
+			resolve: resolvePairing,
+			reject: rejectPairing,
+		} = Promise.withResolvers<Credential>();
+
+		pairingPromise.catch(() => {}); // 防止 unhandled rejection
+
+		const startPairing = (pin: string) => {
+			if (pairingStarted) return;
+			pairingStarted = true;
+
+			this.setState("Handshaking", "pake");
+
+			const credential: CredentialPublicInfo = {
+				myDeviceId: this.myDeviceId,
+				remoteDeviceId: senderId,
+			};
+
+			this.performPAKEClient(credential, pin)
+				.then(resolvePairing)
+				.catch(rejectPairing);
+		};
+
+		// 设置回调：当收到 MSG_USE_YOUR_PIN 消息时，用自己的 PIN 启动 Client
+		this.onUseYourPin = () => {
+			if (waitingForPairing && !pairingStarted) {
+				startPairing(this.PIN);
+			}
+		};
+
+		const request: PairRequest = {
+			remoteDeviceId: senderId,
+			inputOtherPin: (pin: string): void => {
+				pinAttempts++;
+				if (pinAttempts > this.options.maxPinAttempts) {
+					rejectPairing(
+						new SConnectError("PIN_MISMATCH", "Maximum PIN attempts exceeded"),
+					);
+					return;
+				}
+
+				if (!this.validatePin(pin)) {
+					this.emit(
+						"error",
+						new SConnectError("PIN_INVALID", "PIN must be 6 digits"),
+					);
+					rejectPairing(
+						new SConnectError("PIN_INVALID", "PIN must be 6 digits"),
+					);
+					return;
+				}
+
+				if (waitingForPairing) {
+					// waitForPairing 已调用，直接开始配对
+					startPairing(pin);
+				} else {
+					// 保存 PIN，等 waitForPairing 调用
+					savedPin = pin;
+				}
+			},
+			waitForPairing: () => {
+				if (pairingStarted) {
+					// 已经在配对中，直接返回 promise
+				} else if (savedPin) {
+					// inputPin 已调用，开始配对
+					startPairing(savedPin);
+				} else {
+					// 等待 inputPin 调用或 MSG_USE_YOUR_PIN 消息
+					waitingForPairing = true;
+				}
+				return pairingPromise;
+			},
+			reject: () => {
+				// 通知对方配对被拒绝
+				this.signalAdapter
+					.send(new Uint8Array([MSG_PAIR_REJECT]))
+					.catch(() => {});
+				rejectPairing(new SConnectError("PAIRING_FAILED", "Pairing rejected"));
+			},
+		};
+
+		this.emit("pairRequest", request);
 	}
 
 	// ================= 断开 =================
@@ -657,116 +810,6 @@ export class SConnect implements SecureChannel {
 	// 当前配对请求的回调函数，用于处理 MSG_PAIR_REJECT 消息
 	private onPairReject: (() => void) | null = null;
 
-	private handlePairRequest(payload: Uint8Array): void {
-		if (!this.pairLimiter.canExecute()) {
-			// 考虑到id都是临时可变的，无法区分真实设备，所以全部限制
-			// todo 中间信息攻击，比如useyourpin dos，或者其它，需要状态机限制顺序和个数
-			// todo 提示被频繁占用
-			// todo 其他可能的配对方式
-			this.signalAdapter
-				.send(new Uint8Array([MSG_PAIR_REJECT]))
-				.catch(() => {}); // todo 区分拒绝原因
-			return;
-		}
-
-		const senderIdLength = new DataView(
-			payload.buffer,
-			payload.byteOffset,
-		).getUint16(0);
-		const senderId = new TextDecoder().decode(
-			payload.subarray(2, 2 + senderIdLength),
-		);
-
-		let pinAttempts = 0;
-		let savedPin: string | null = null;
-		let pairingStarted = false;
-		let waitingForPairing = false;
-
-		const {
-			promise: pairingPromise,
-			resolve: resolvePairing,
-			reject: rejectPairing,
-		} = Promise.withResolvers<Credential>();
-
-		pairingPromise.catch(() => {}); // 防止 unhandled rejection
-
-		const startPairing = (pin: string) => {
-			if (pairingStarted) return;
-			pairingStarted = true;
-
-			this.setState("Handshaking", "pake");
-
-			const credential: CredentialPublicInfo = {
-				myDeviceId: this.myDeviceId,
-				remoteDeviceId: senderId,
-			};
-
-			this.performPAKEClient(credential, pin)
-				.then(resolvePairing)
-				.catch(rejectPairing);
-		};
-
-		// 设置回调：当收到 MSG_USE_YOUR_PIN 消息时，用自己的 PIN 启动 Client
-		this.onUseYourPin = () => {
-			if (waitingForPairing && !pairingStarted) {
-				startPairing(this.PIN);
-			}
-		};
-
-		const request: PairRequest = {
-			remoteDeviceId: senderId,
-			inputOtherPin: (pin: string): void => {
-				pinAttempts++;
-				if (pinAttempts > this.options.maxPinAttempts) {
-					rejectPairing(
-						new SConnectError("PIN_MISMATCH", "Maximum PIN attempts exceeded"),
-					);
-					return;
-				}
-
-				if (!this.validatePin(pin)) {
-					this.emit(
-						"error",
-						new SConnectError("PIN_INVALID", "PIN must be 6 digits"),
-					);
-					rejectPairing(
-						new SConnectError("PIN_INVALID", "PIN must be 6 digits"),
-					);
-					return;
-				}
-
-				if (waitingForPairing) {
-					// waitForPairing 已调用，直接开始配对
-					startPairing(pin);
-				} else {
-					// 保存 PIN，等 waitForPairing 调用
-					savedPin = pin;
-				}
-			},
-			waitForPairing: () => {
-				if (pairingStarted) {
-					// 已经在配对中，直接返回 promise
-				} else if (savedPin) {
-					// inputPin 已调用，开始配对
-					startPairing(savedPin);
-				} else {
-					// 等待 inputPin 调用或 MSG_USE_YOUR_PIN 消息
-					waitingForPairing = true;
-				}
-				return pairingPromise;
-			},
-			reject: () => {
-				// 通知对方配对被拒绝
-				this.signalAdapter
-					.send(new Uint8Array([MSG_PAIR_REJECT]))
-					.catch(() => {});
-				rejectPairing(new SConnectError("PAIRING_FAILED", "Pairing rejected"));
-			},
-		};
-
-		this.emit("pairRequest", request);
-	}
-
 	private async sendPairRequest(
 		credential: CredentialPublicInfo,
 	): Promise<void> {
@@ -782,49 +825,6 @@ export class SConnect implements SecureChannel {
 	}
 
 	// ================= 连接请求 =================
-
-	private handleConnectRequest(payload: Uint8Array): void {
-		const senderIdLength = new DataView(
-			payload.buffer,
-			payload.byteOffset,
-		).getUint16(0);
-		const senderId = new TextDecoder().decode(
-			payload.subarray(2, 2 + senderIdLength),
-		);
-
-		if (senderId !== this.remoteId) {
-			this.sendHandshakeMessage(MSG_CONNECT_REJECT, new Uint8Array(0)).catch(
-				() => {},
-			);
-			return;
-		}
-
-		if (!this.connectLimiter.canExecute()) {
-			// todo 提示被频繁占用
-			this.signalAdapter
-				.send(new Uint8Array([MSG_CONNECT_REJECT]))
-				.catch(() => {});
-			return;
-		}
-
-		const request: ConnectRequest = {
-			remoteDeviceId: senderId,
-			accept: (credential: Credential): Promise<ConnectResult> => {
-				this.setState("Handshaking", "connect-response");
-				this.sendHandshakeMessage(MSG_CONNECT_ACCEPT, new Uint8Array(0)).catch(
-					() => {},
-				);
-				return this.performIKResponder(credential);
-			},
-			reject: () => {
-				this.sendHandshakeMessage(MSG_CONNECT_REJECT, new Uint8Array(0)).catch(
-					() => {},
-				);
-			},
-		};
-
-		this.emit("connectRequest", request);
-	}
 
 	private async sendConnectRequest(
 		credential: CredentialPrivateInfo,
