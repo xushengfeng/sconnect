@@ -12,7 +12,6 @@ import type {
 	SecureChannelEvents,
 	SignalingAdapter,
 } from "./sconnect_type";
-import { spake2 } from "./spake/index";
 import {
 	createNoise,
 	initialiseNoise,
@@ -39,6 +38,7 @@ const MSG_ERROR = 0x06;
 const MSG_NOISE_DATA = 0x10;
 const MSG_SPAKE_DATA = 0x11;
 const MSG_APP_DATA = 0x20;
+const MSG_BLIND_PUBLIC_KEY = 0x12;
 
 // 错误类
 class SConnectError extends Error {
@@ -114,6 +114,11 @@ export class SConnect implements SecureChannel {
 		| ((type: number, payload: Uint8Array) => void)
 		| null = null;
 	private handshakeMessageQueue: { type: number; payload: Uint8Array }[] = [];
+	private typeMessageQueue: { type: number; payload: Uint8Array }[] = [];
+	private typeMessageResolvers: Map<
+		number,
+		{ resolve: (data: Uint8Array) => void; reject: (err: Error) => void }
+	> = new Map();
 
 	// 设备身份
 	private myDeviceId = "";
@@ -272,97 +277,126 @@ export class SConnect implements SecureChannel {
 		}
 
 		const pin = this.PIN || this.updatePIN();
-		let pinAttempts = 0;
-		let pairingStarted = false;
-		let waitingForPairing = false;
-		let savedPin: string | null = null;
 
 		await this.signalAdapter.connect(credential.remoteDeviceId);
 
-		const {
-			promise: pairingPromise,
-			resolve: resolvePairing,
-			reject: rejectPairing,
-		} = Promise.withResolvers<Credential>();
-		pairingPromise.catch(() => {}); // 防止 unhandled rejection
-
-		this.setState("Handshaking", "pake");
-
-		// 设置回调：当收到 MSG_PAIR_REJECT 消息时，立即 reject
-		this.onPairReject = () => {
-			this.setState("Ready");
-			rejectPairing(
-				new SConnectError("PAIRING_FAILED", "Pairing rejected by peer"),
-			);
-			pairingStarted = true; // 确保其他地方不再启动
-		};
-
-		// startResponder 始终作为 Server，使用指定的 PIN 计算 verifier
-		const startResponder = (usePin: string) => {
-			if (pairingStarted) return;
-			pairingStarted = true;
-			this.setupPAKEResponder(credential, usePin)
-				.then(resolvePairing)
-				.catch(rejectPairing);
-		};
+		const otherPin = Promise.withResolvers<string>();
 
 		const inputOtherPin = (remotePin: string) => {
-			if (pairingStarted) return;
-
-			pinAttempts++;
-
-			// todo 掩耳盗铃
-			if (pinAttempts > this.options.maxPinAttempts) {
-				this.setState("Ready");
-				rejectPairing(
-					new SConnectError("PIN_MISMATCH", "Maximum PIN attempts exceeded"),
-				);
-				return;
-			}
-
 			if (!this.validatePin(remotePin)) {
-				this.emit(
-					"error",
+				otherPin.reject(
 					new SConnectError("PIN_INVALID", "PIN must be 6 digits"),
 				);
-				rejectPairing(new SConnectError("PIN_INVALID", "PIN must be 6 digits"));
-				return;
+				throw new SConnectError("PIN_INVALID", "PIN must be 6 digits");
 			}
 
-			// 通知对方使用自己的 PIN
-			this.signalAdapter
-				.send(new Uint8Array([MSG_USE_YOUR_PIN]))
-				.catch(() => {});
-
-			if (waitingForPairing) {
-				// waitForPairing 已调用，用远程 PIN 启动 Server
-				startResponder(remotePin);
-			} else {
-				// 保存 PIN，等 waitForPairing 调用
-				savedPin = remotePin;
-			}
+			otherPin.resolve(remotePin);
 		};
 
-		const waitForPairing = (): Promise<Credential> => {
-			if (pairingStarted) {
-				return pairingPromise;
-			}
-
-			if (savedPin) {
-				// inputOtherPin 已调用，用远程 PIN 启动 Server
-				startResponder(savedPin);
-			} else {
-				// 未调用 inputOtherPin，用自己的 PIN 启动 Server
-				waitingForPairing = true;
-				startResponder(pin);
-			}
-			return pairingPromise;
-		};
+		const waitForPairing = Promise.withResolvers<Credential>();
 
 		// 发送配对请求
-		this.sendPairRequest(credential).catch(rejectPairing);
+		this.sendTypeMessage(
+			MSG_PAIR_REQUEST,
+			new TextEncoder().encode(this.myDeviceId),
+		).catch(() => {});
 
-		return { pin, inputOtherPin, waitForPairing };
+		this.getTypeMessage(MSG_PAIR_REJECT).then(() => {
+			waitForPairing.reject(
+				new SConnectError("PAIRING_FAILED", "Pairing request was rejected"),
+			);
+		});
+
+		return {
+			pin,
+			inputOtherPin,
+			waitForPairing: () => {
+				this.genWaitForPairing({
+					remoteDeviceId: credential.remoteDeviceId,
+					otherPin: otherPin.promise,
+					PIN: pin,
+				})
+					.then(waitForPairing.resolve)
+					.catch(waitForPairing.reject);
+				return waitForPairing.promise;
+			},
+		};
+	}
+
+	private async genWaitForPairing(op: {
+		remoteDeviceId: string;
+		otherPin: Promise<string>;
+		PIN: string;
+	}): Promise<Credential> {
+		const keyPair = await generateKeyPair();
+		const finalPin = await Promise.race([
+			(async () => {
+				const pin = await op.otherPin;
+				await this.sendTypeMessage(MSG_USE_YOUR_PIN);
+				return pin;
+			})(),
+			(async () => {
+				await this.getTypeMessage(MSG_USE_YOUR_PIN);
+				return op.PIN;
+			})(),
+		]);
+		const bindPublicKey = blind(finalPin, keyPair.publicKey);
+		await this.sendTypeMessage(MSG_BLIND_PUBLIC_KEY, bindPublicKey);
+		const otherBindPublicKey = await this.getTypeMessage(MSG_BLIND_PUBLIC_KEY);
+		if (otherBindPublicKey === undefined) {
+			throw new SConnectError(
+				"PAIRING_FAILED",
+				"Failed to receive blinded public key from peer",
+			);
+		}
+		const otherPublicKey = deBlind(otherBindPublicKey, finalPin);
+		const s = await dh(keyPair.privateKey, otherPublicKey);
+
+		const info = buildPairingInfo(
+			finalPin,
+			this.myDeviceId,
+			op.remoteDeviceId,
+			keyPair.publicKey,
+			otherPublicKey,
+		);
+		const derivedKey = await derive(
+			s,
+			info,
+			new TextEncoder().encode(finalPin),
+		);
+		const myMac = await mac(derivedKey, info);
+		await this.sendTypeMessage(MSG_SPAKE_DATA, myMac);
+		const otherMac = await this.getTypeMessage(MSG_SPAKE_DATA);
+
+		const otherInfo = buildPairingInfo(
+			finalPin,
+			op.remoteDeviceId,
+			this.myDeviceId,
+			otherPublicKey,
+			keyPair.publicKey,
+		);
+		const otherDerivedKey = await derive(
+			s,
+			otherInfo,
+			new TextEncoder().encode(finalPin),
+		);
+		const otherMacCheck = await mac(otherDerivedKey, otherInfo);
+
+		if (!verify(otherMac, otherMacCheck)) {
+			throw new SConnectError("PAIRING_FAILED", "Pairing verification failed");
+		}
+
+		this.setState("Connected");
+
+		return {
+			// todo 用S加密轮换新的对
+			myPrivateKey: keyPair.privateKey,
+			myPublicKey: keyPair.publicKey,
+			remotePublicKey: otherPublicKey,
+			createdAt: Date.now(),
+			myDeviceId: this.myDeviceId,
+			remoteDeviceId: this.remoteId,
+		};
 	}
 
 	private handlePairRequest(payload: Uint8Array): void {
@@ -377,98 +411,32 @@ export class SConnect implements SecureChannel {
 			return;
 		}
 
-		const senderIdLength = new DataView(
-			payload.buffer,
-			payload.byteOffset,
-		).getUint16(0);
-		const senderId = new TextDecoder().decode(
-			payload.subarray(2, 2 + senderIdLength),
-		);
+		const senderId = new TextDecoder().decode(payload);
 
-		let pinAttempts = 0;
-		let savedPin: string | null = null;
-		let pairingStarted = false;
-		let waitingForPairing = false;
-
-		const {
-			promise: pairingPromise,
-			resolve: resolvePairing,
-			reject: rejectPairing,
-		} = Promise.withResolvers<Credential>();
-
-		pairingPromise.catch(() => {}); // 防止 unhandled rejection
-
-		const startPairing = (pin: string) => {
-			if (pairingStarted) return;
-			pairingStarted = true;
-
-			this.setState("Handshaking", "pake");
-
-			const credential: CredentialPublicInfo = {
-				myDeviceId: this.myDeviceId,
-				remoteDeviceId: senderId,
-			};
-
-			this.performPAKEClient(credential, pin)
-				.then(resolvePairing)
-				.catch(rejectPairing);
-		};
-
-		// 设置回调：当收到 MSG_USE_YOUR_PIN 消息时，用自己的 PIN 启动 Client
-		this.onUseYourPin = () => {
-			if (waitingForPairing && !pairingStarted) {
-				startPairing(this.PIN);
-			}
-		};
+		const otherPin = Promise.withResolvers<string>();
 
 		const request: PairRequest = {
 			remoteDeviceId: senderId,
 			inputOtherPin: (pin: string): void => {
-				pinAttempts++;
-				if (pinAttempts > this.options.maxPinAttempts) {
-					rejectPairing(
-						new SConnectError("PIN_MISMATCH", "Maximum PIN attempts exceeded"),
-					);
-					return;
-				}
-
 				if (!this.validatePin(pin)) {
-					this.emit(
-						"error",
-						new SConnectError("PIN_INVALID", "PIN must be 6 digits"),
-					);
-					rejectPairing(
-						new SConnectError("PIN_INVALID", "PIN must be 6 digits"),
-					);
-					return;
+					otherPin.reject();
+					throw new SConnectError("PIN_INVALID", "PIN must be 6 digits");
 				}
 
-				if (waitingForPairing) {
-					// waitForPairing 已调用，直接开始配对
-					startPairing(pin);
-				} else {
-					// 保存 PIN，等 waitForPairing 调用
-					savedPin = pin;
-				}
+				otherPin.resolve(pin);
 			},
 			waitForPairing: () => {
-				if (pairingStarted) {
-					// 已经在配对中，直接返回 promise
-				} else if (savedPin) {
-					// inputPin 已调用，开始配对
-					startPairing(savedPin);
-				} else {
-					// 等待 inputPin 调用或 MSG_USE_YOUR_PIN 消息
-					waitingForPairing = true;
-				}
-				return pairingPromise;
+				return this.genWaitForPairing({
+					remoteDeviceId: senderId,
+					otherPin: otherPin.promise,
+					PIN: this.PIN,
+				});
 			},
 			reject: () => {
 				// 通知对方配对被拒绝
 				this.signalAdapter
 					.send(new Uint8Array([MSG_PAIR_REJECT]))
 					.catch(() => {});
-				rejectPairing(new SConnectError("PAIRING_FAILED", "Pairing rejected"));
 			},
 		};
 
@@ -484,7 +452,6 @@ export class SConnect implements SecureChannel {
 		this.receiveCipher = null;
 
 		// 清理回调
-		this.onUseYourPin = null;
 		this.onPairReject = null;
 
 		if (this.noise) {
@@ -633,6 +600,15 @@ export class SConnect implements SecureChannel {
 			return;
 		}
 
+		if (this.state !== "Connected") {
+			const handlers = this.typeMessageResolvers.get(type);
+			if (handlers) {
+				handlers.resolve(data.subarray(1));
+			} else {
+				this.typeMessageQueue.push({ type, payload: data.subarray(1) });
+			}
+		}
+
 		switch (this.state) {
 			case "Idle":
 				return;
@@ -706,11 +682,6 @@ export class SConnect implements SecureChannel {
 			return;
 		}
 
-		if (type === MSG_USE_YOUR_PIN) {
-			this.handleUseYourPin();
-			return;
-		}
-
 		// 其他握手消息由各握手方法的消息处理器处理
 		if (this.handshakeMessageHandler) {
 			this.handshakeMessageHandler(type, payload);
@@ -728,19 +699,9 @@ export class SConnect implements SecureChannel {
 			case MSG_PAIR_REQUEST:
 				this.handlePairRequest(payload);
 				break;
-			case MSG_USE_YOUR_PIN:
-				this.handleUseYourPin();
-				break;
 			case MSG_CONNECT_REQUEST:
 				this.handleConnectRequest(payload);
 				break;
-		}
-	}
-
-	private handleUseYourPin(): void {
-		if (this.onUseYourPin) {
-			this.onUseYourPin();
-			this.onUseYourPin = null;
 		}
 	}
 
@@ -805,24 +766,8 @@ export class SConnect implements SecureChannel {
 
 	// ================= 配对请求 =================
 
-	// 当前配对请求的回调函数，用于处理 MSG_USE_YOUR_PIN 消息
-	private onUseYourPin: (() => void) | null = null;
 	// 当前配对请求的回调函数，用于处理 MSG_PAIR_REJECT 消息
 	private onPairReject: (() => void) | null = null;
-
-	private async sendPairRequest(
-		credential: CredentialPublicInfo,
-	): Promise<void> {
-		await this.signalAdapter.connect(credential.remoteDeviceId);
-
-		const myIdBytes = new TextEncoder().encode(this.myDeviceId);
-		const message = new Uint8Array(1 + 2 + myIdBytes.length);
-		message[0] = MSG_PAIR_REQUEST;
-		new DataView(message.buffer).setUint16(1, myIdBytes.length);
-		message.set(myIdBytes, 3);
-
-		await this.signalAdapter.send(message);
-	}
 
 	// ================= 连接请求 =================
 
@@ -864,177 +809,6 @@ export class SConnect implements SecureChannel {
 			this.signalAdapter.send(message).catch((err) => {
 				clearTimeout(timeout);
 				this.activeTimers.delete(timeout);
-				this.restoreMessageHandler();
-				this.setState("Ready");
-				reject(err);
-			});
-		});
-	}
-
-	// ================= PAKE =================
-
-	private async setupPAKEResponder(
-		credential: CredentialPublicInfo,
-		myPin: string,
-	): Promise<Credential> {
-		await this.signalAdapter.connect(credential.remoteDeviceId);
-
-		const spake = spake2({
-			mhf: { n: 1024, r: 8, p: 16 },
-			kdf: { AAD: "sconnect-pairing" },
-		});
-
-		const verifier = await spake.computeVerifier(
-			myPin,
-			credential.myDeviceId + credential.remoteDeviceId,
-			credential.myDeviceId,
-			credential.remoteDeviceId,
-		);
-
-		const serverState = await spake.startServer(
-			credential.myDeviceId,
-			credential.remoteDeviceId,
-			verifier,
-		);
-
-		return new Promise((resolve, reject) => {
-			const timeout = this.createTimer(() => {
-				this.restoreMessageHandler();
-				this.setState("Ready");
-				this.sendErrorToPeer("TIMEOUT", "PAKE pairing timeout");
-				reject(new SConnectError("TIMEOUT", "PAKE pairing timeout"));
-			}, this.options.pairingTimeout);
-
-			const messageHandler = async (type: number, payload: Uint8Array) => {
-				if (type !== MSG_SPAKE_DATA) return;
-				try {
-					const spakeLen = new DataView(
-						payload.buffer,
-						payload.byteOffset,
-					).getUint16(0);
-					const spakeMsg = payload.subarray(2, 2 + spakeLen);
-					const remotePublicKey = payload.subarray(2 + spakeLen);
-
-					const serverMsg = serverState.getMessage();
-					const myPublicKey = this.myKeyPair?.publicKey ?? new Uint8Array();
-					const response = new Uint8Array(
-						2 + serverMsg.length + myPublicKey.length,
-					);
-					new DataView(response.buffer).setUint16(0, serverMsg.length);
-					response.set(serverMsg, 2);
-					response.set(myPublicKey, 2 + serverMsg.length);
-					await this.sendHandshakeMessage(MSG_SPAKE_DATA, response);
-
-					const sharedSecret = await serverState.finish(spakeMsg);
-
-					this.activeTimers.delete(timeout);
-					clearTimeout(timeout);
-					this.restoreMessageHandler();
-					this.initializeEncryption(sharedSecret.toBuffer());
-
-					const fullCredential: Credential = {
-						...credential,
-						myPrivateKey: this.myKeyPair?.privateKey ?? new Uint8Array(),
-						myPublicKey,
-						remotePublicKey: new Uint8Array(remotePublicKey),
-						createdAt: Date.now(),
-						lastConnected: Date.now(),
-					};
-
-					this.setState("Connected");
-					this.remoteId = credential.remoteDeviceId;
-					this.emit("ready");
-					resolve(fullCredential);
-				} catch {
-					this.activeTimers.delete(timeout);
-					clearTimeout(timeout);
-					this.restoreMessageHandler();
-					this.setState("Ready");
-					reject(new SConnectError("PAKE_FAILED", "PAKE protocol failed"));
-				}
-			};
-
-			this.setHandshakeMessageHandler(messageHandler);
-		});
-	}
-
-	private async performPAKEClient(
-		credential: CredentialPublicInfo,
-		remotePin: string,
-	): Promise<Credential> {
-		await this.signalAdapter.connect(credential.remoteDeviceId);
-
-		const spake = spake2({
-			mhf: { n: 1024, r: 8, p: 16 },
-			kdf: { AAD: "sconnect-pairing" },
-		});
-
-		const clientState = await spake.startClient(
-			credential.remoteDeviceId,
-			credential.myDeviceId,
-			remotePin,
-			credential.remoteDeviceId + credential.myDeviceId,
-		);
-
-		const clientMsg = clientState.getMessage();
-		const myPublicKey = this.myKeyPair?.publicKey ?? new Uint8Array();
-		const message = new Uint8Array(2 + clientMsg.length + myPublicKey.length);
-		new DataView(message.buffer).setUint16(0, clientMsg.length);
-		message.set(clientMsg, 2);
-		message.set(myPublicKey, 2 + clientMsg.length);
-
-		return new Promise((resolve, reject) => {
-			const timeout = this.createTimer(() => {
-				this.restoreMessageHandler();
-				this.setState("Ready");
-				this.sendErrorToPeer("TIMEOUT", "PAKE pairing timeout");
-				reject(new SConnectError("TIMEOUT", "PAKE pairing timeout"));
-			}, this.options.pairingTimeout);
-
-			const messageHandler = async (type: number, payload: Uint8Array) => {
-				if (type !== MSG_SPAKE_DATA) return;
-				try {
-					const spakeLen = new DataView(
-						payload.buffer,
-						payload.byteOffset,
-					).getUint16(0);
-					const spakeMsg = payload.subarray(2, 2 + spakeLen);
-					const remotePublicKey = payload.subarray(2 + spakeLen);
-
-					const sharedSecret = await clientState.finish(spakeMsg);
-
-					this.activeTimers.delete(timeout);
-					clearTimeout(timeout);
-					this.restoreMessageHandler();
-					this.initializeEncryption(sharedSecret.toBuffer());
-
-					const fullCredential: Credential = {
-						...credential,
-						myPrivateKey: this.myKeyPair?.privateKey ?? new Uint8Array(),
-						myPublicKey,
-						remotePublicKey: new Uint8Array(remotePublicKey),
-						createdAt: Date.now(),
-						lastConnected: Date.now(),
-					};
-
-					this.setState("Connected");
-					this.remoteId = credential.remoteDeviceId;
-					this.emit("ready");
-					resolve(fullCredential);
-				} catch {
-					this.activeTimers.delete(timeout);
-					clearTimeout(timeout);
-					this.restoreMessageHandler();
-					this.setState("Ready");
-					reject(new SConnectError("PAKE_FAILED", "PAKE protocol failed"));
-				}
-			};
-
-			this.setHandshakeMessageHandler(messageHandler);
-
-			this.sendHandshakeMessage(MSG_SPAKE_DATA, message).catch((err) => {
-				this.activeTimers.delete(timeout);
-				clearTimeout(timeout);
 				this.restoreMessageHandler();
 				this.setState("Ready");
 				reject(err);
@@ -1193,6 +967,39 @@ export class SConnect implements SecureChannel {
 		await this.signalAdapter.send(message);
 	}
 
+	private async sendTypeMessage(
+		type: number,
+		payload?: Uint8Array,
+	): Promise<void> {
+		const message = new Uint8Array(1 + (payload ? payload.length : 0));
+		message[0] = type;
+		if (payload) {
+			message.set(payload, 1);
+		}
+		await this.signalAdapter.send(message);
+	}
+
+	private getTypeMessage(type: number) {
+		const p = Promise.withResolvers<Uint8Array>();
+		const recived = this.typeMessageQueue.findIndex((msg) => msg.type === type);
+		if (recived !== -1) {
+			const msg = this.typeMessageQueue.splice(recived, 1)[0];
+			p.resolve(msg.payload);
+			return p.promise;
+		}
+		this.typeMessageResolvers.set(type, {
+			resolve: (data: Uint8Array) => {
+				this.typeMessageResolvers.delete(type);
+				p.resolve(data);
+			},
+			reject: (err: Error) => {
+				this.typeMessageResolvers.delete(type);
+				p.reject(err);
+			},
+		});
+		return p.promise;
+	}
+
 	private setHandshakeMessageHandler(
 		handler: (type: number, payload: Uint8Array) => void,
 	): void {
@@ -1209,18 +1016,6 @@ export class SConnect implements SecureChannel {
 	private restoreMessageHandler(): void {
 		this.handshakeMessageHandler = null;
 		this.handshakeMessageQueue = [];
-	}
-
-	private initializeEncryption(sharedSecret: Uint8Array): void {
-		const secretArray = new Uint8Array(sharedSecret);
-		const key = new Uint8Array(32);
-		key.set(secretArray.subarray(0, Math.min(16, secretArray.length)), 0);
-		key.set(secretArray.subarray(0, Math.min(16, secretArray.length)), 16);
-
-		if (!this.signalAdapter.supportNativeEncryption) {
-			this.sendCipher = createCipher(key);
-			this.receiveCipher = createCipher(key);
-		}
 	}
 
 	private buildCredential(
@@ -1299,4 +1094,165 @@ export class SConnect implements SecureChannel {
 			privateKey: new Uint8Array(privateKeyBuffer).subarray(16),
 		};
 	}
+}
+
+export async function generateKeyPair(): Promise<KeyPair> {
+	const keyPair = await crypto.subtle.generateKey(
+		{ name: "X25519" } as AlgorithmIdentifier,
+		true,
+		["deriveBits"],
+	);
+
+	const publicKeyBuffer = await crypto.subtle.exportKey(
+		"raw",
+		(keyPair as CryptoKeyPair).publicKey,
+	);
+	const privateKeyBuffer = await crypto.subtle.exportKey(
+		"pkcs8",
+		(keyPair as CryptoKeyPair).privateKey,
+	);
+
+	return {
+		publicKey: new Uint8Array(publicKeyBuffer),
+		privateKey: new Uint8Array(privateKeyBuffer).subarray(16),
+	};
+}
+
+// todo 更安全做法
+export function blind(pin: string, publicKey: Uint8Array): Uint8Array {
+	// 将 PIN 转换为 Uint8Array
+	const pinBytes = new TextEncoder().encode(pin);
+
+	// 创建一个新的 Uint8Array 来存储盲化后的公钥
+	const blindedKey = new Uint8Array(publicKey.length);
+
+	// 对每个字节进行盲化处理
+	for (let i = 0; i < publicKey.length; i++) {
+		blindedKey[i] = publicKey[i] ^ pinBytes[i % pinBytes.length];
+	}
+
+	return blindedKey;
+}
+
+export function deBlind(blindedKey: Uint8Array, pin: string): Uint8Array {
+	// 将 PIN 转换为 Uint8Array
+	const pinBytes = new TextEncoder().encode(pin);
+
+	// 创建一个新的 Uint8Array 来存储去盲化后的公钥
+	const originalKey = new Uint8Array(blindedKey.length);
+
+	// 对每个字节进行去盲化处理
+	for (let i = 0; i < blindedKey.length; i++) {
+		originalKey[i] = blindedKey[i] ^ pinBytes[i % pinBytes.length];
+	}
+
+	return originalKey;
+}
+
+export async function dh(
+	privateKey: Uint8Array,
+	publicKey: Uint8Array,
+): Promise<Uint8Array> {
+	const privKey = await crypto.subtle.importKey(
+		"pkcs8",
+		buildPkcs8(privateKey),
+		"X25519",
+		false,
+		["deriveBits"],
+	);
+	const pubKey = await crypto.subtle.importKey(
+		"raw",
+		publicKey as unknown as BufferSource,
+		"X25519",
+		false,
+		[],
+	);
+	const bits = await crypto.subtle.deriveBits(
+		{ name: "X25519", public: pubKey },
+		privKey,
+		256,
+	);
+	return new Uint8Array(bits);
+}
+
+function buildPkcs8(rawPrivKey: Uint8Array): ArrayBuffer {
+	const header = new Uint8Array([
+		0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e,
+		0x04, 0x22, 0x04, 0x20,
+	]);
+	const buf = new Uint8Array(header.length + rawPrivKey.length);
+	buf.set(header, 0);
+	buf.set(rawPrivKey, header.length);
+	return buf.buffer;
+}
+
+function buildPairingInfo(
+	pin: string,
+	localId: string,
+	remoteId: string,
+	localEphemeralPk: Uint8Array,
+	remoteEphemeralPk: Uint8Array,
+): ArrayBuffer {
+	const enc = new TextEncoder();
+	const pinBytes = enc.encode(pin);
+	const localIdBytes = enc.encode(localId);
+	const remoteIdBytes = enc.encode(remoteId);
+
+	const buf = new Uint8Array(
+		[
+			pinBytes,
+			localIdBytes,
+			remoteIdBytes,
+			localEphemeralPk,
+			remoteEphemeralPk,
+		].flatMap((arr) => [...arr]),
+	);
+
+	return buf.buffer;
+}
+
+async function derive(
+	ikm: Uint8Array,
+	info: ArrayBuffer,
+	salt: Uint8Array,
+): Promise<Uint8Array> {
+	const key = await crypto.subtle.importKey(
+		"raw",
+		ikm as unknown as BufferSource,
+		"HKDF",
+		false,
+		["deriveBits"],
+	);
+	const bits = await crypto.subtle.deriveBits(
+		{
+			name: "HKDF",
+			hash: "SHA-256",
+			salt: salt as unknown as BufferSource,
+			info,
+		},
+		key,
+		256,
+	);
+	return new Uint8Array(bits);
+}
+
+async function mac(key: Uint8Array, data: ArrayBuffer): Promise<Uint8Array> {
+	const cryptoKey = await crypto.subtle.importKey(
+		"raw",
+		key as unknown as BufferSource,
+		{ name: "HMAC", hash: "SHA-256" },
+		false,
+		["sign"],
+	);
+	const sig = await crypto.subtle.sign("HMAC", cryptoKey, data);
+	return new Uint8Array(sig);
+}
+
+function verify(key: Uint8Array, key2: Uint8Array) {
+	if (key.byteLength !== key2.byteLength) return false;
+	const a = key;
+	const b = key2;
+	let diff = 0;
+	for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+	return diff === 0;
 }

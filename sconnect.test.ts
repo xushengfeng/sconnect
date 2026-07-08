@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { SConnect } from "./sconnect";
+import { blind, deBlind, dh, generateKeyPair, SConnect } from "./sconnect";
 import { LoopbackAdapter, UntrustedLoopbackAdapter } from "./loopback_adapter";
 import type { ConnectRequest, PairRequest } from "./sconnect_type";
 
@@ -262,9 +262,7 @@ describe("SConnect", () => {
 			const pairRequest = await pairRequestPromise;
 
 			// B 拒绝配对 - 需要捕获 rejection
-			const rejectPromise = pairRequest.waitForPairing().catch(() => {});
 			pairRequest.reject();
-			await rejectPromise;
 
 			// A 应该立即收到拒绝通知（不是超时）
 			await expect(pairingA.waitForPairing()).rejects.toThrow();
@@ -801,10 +799,17 @@ describe("SConnect", () => {
 	});
 });
 
-// TODO: 安全性验证
-// - 验证 Noise IK 握手的前向安全性
-// - 验证 SPAKE2 协议的正确性（PIN 错误时应拒绝连接）
-// - 验证会话密钥的隔离性（不同会话使用不同密钥）
-// - 验证重放攻击防护
-// - 验证中间人攻击防护
-// - 验证凭证轮换的正确性
+describe('密码学验证',()=>{
+	it('dh交换',async()=>{
+		const keyPairA = await generateKeyPair();
+		const keyPairB = await generateKeyPair();
+		expect(await dh(keyPairA.privateKey, keyPairB.publicKey)).toEqual(await dh(keyPairB.privateKey, keyPairA.publicKey));
+	})
+	it('盲签名',async()=>{
+		const keyPair = await generateKeyPair();
+		const pin = '1234';
+		const blinded = blind(pin, keyPair.publicKey);
+		const deblinded = deBlind(blinded, pin);
+		expect(deblinded).toEqual(keyPair.publicKey);
+	})
+})
