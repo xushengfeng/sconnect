@@ -98,16 +98,6 @@ export declare class SecureChannel {
 
 	/** 移除事件监听 */
 	off(event: string, callback: Function): void;
-
-	// ================= 主动凭证管理 =================
-
-	/**
-	 * 主动轮换我方长期凭证（生成新密钥对并与对方交换）。
-	 * 完成后会触发 `credentialRotated` 事件，应用层应保存新凭证。
-	 *
-	 * 仅在通道处于 `ready` 状态时可调用。
-	 */
-	rotateCredential(): Promise<void>;
 }
 
 // ================= 相关类型定义 =================
@@ -249,8 +239,6 @@ export type SecureChannelEvents = {
 	error: (err: SConnectError) => void;
 	pairRequest: (request: PairRequest) => void;
 	connectRequest: (request: ConnectRequest) => void;
-	credentialRotated: (updatedCredential: Credential) => void;
-	credentialInvalidated: (remoteDeviceId: string) => void;
 };
 
 // ================= 状态类型 =================

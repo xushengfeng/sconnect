@@ -107,7 +107,6 @@ export class SConnect implements SecureChannel {
 
 	// 设备身份
 	private myDeviceId = "";
-	private myKeyPair: KeyPair | null = null;
 
 	// 计时器管理
 	private activeTimers: Set<ReturnType<typeof setTimeout>> = new Set();
@@ -150,8 +149,6 @@ export class SConnect implements SecureChannel {
 			this.remoteId = remoteId;
 		}
 		await this.signalAdapter.init(myDeviceId);
-
-		this.myKeyPair = await generateKeyPair();
 
 		this.setState("Ready");
 	}
@@ -518,7 +515,6 @@ export class SConnect implements SecureChannel {
 
 		this.signalAdapter.close();
 		this.myDeviceId = "";
-		this.myKeyPair = null;
 		this.setState("Idle");
 	}
 
@@ -577,16 +573,6 @@ export class SConnect implements SecureChannel {
 		if (handlers) {
 			handlers.delete(callback);
 		}
-	}
-
-	async rotateCredential(): Promise<void> {
-		if (this.state !== "Connected") {
-			throw new SConnectError(
-				"CHANNEL_NOT_READY",
-				`Cannot rotate in ${this.state} state`,
-			);
-		}
-		// TODO: implement credential rotation
 	}
 
 	// ================= 状态机 =================
@@ -669,19 +655,6 @@ export class SConnect implements SecureChannel {
 			}
 		}
 
-		const text = this.textDecoder.decode(payload);
-		try {
-			const parsed = JSON.parse(text);
-			if (parsed.type === "credential_rotation") {
-				this.emit("credentialRotated", {
-					remotePublicKey: new Uint8Array(parsed.publicKey),
-				} as Credential);
-				return;
-			}
-		} catch {
-			// Not JSON
-		}
-
 		this.emit("data", payload.buffer as ArrayBuffer, () =>
 			this.textDecoder.decode(payload),
 		);
@@ -741,7 +714,7 @@ export class SConnect implements SecureChannel {
 			myDeviceId: this.myDeviceId,
 			remoteDeviceId: this.remoteId,
 			myPrivateKey: new Uint8Array(),
-			myPublicKey: this.myKeyPair?.publicKey ?? new Uint8Array(),
+			myPublicKey:  new Uint8Array(),
 			remotePublicKey: new Uint8Array(),
 			createdAt: Date.now(),
 			lastConnected: Date.now(),
