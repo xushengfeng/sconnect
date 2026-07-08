@@ -12,15 +12,6 @@ import type {
 	SecureChannelEvents,
 	SignalingAdapter,
 } from "./sconnect_type";
-import {
-	createNoise,
-	initialiseNoise,
-	sendNoise,
-	recvNoise,
-	destroyNoise,
-	createCipher,
-	type NoiseState,
-} from "./noise_utils";
 
 interface KeyPair {
 	publicKey: Uint8Array;
@@ -28,17 +19,17 @@ interface KeyPair {
 }
 
 // 协议消息类型
-const MSG_PAIR_REQUEST = 0x01;
-const MSG_USE_YOUR_PIN = 0x02; // 通知对方使用自己的 PIN
-const MSG_PAIR_REJECT = 0x07; // 拒绝配对请求
-const MSG_CONNECT_REQUEST = 0x03;
-const MSG_CONNECT_ACCEPT = 0x04;
-const MSG_CONNECT_REJECT = 0x05;
-const MSG_ERROR = 0x06;
-const MSG_NOISE_DATA = 0x10;
-const MSG_SPAKE_DATA = 0x11;
-const MSG_APP_DATA = 0x20;
-const MSG_BLIND_PUBLIC_KEY = 0x12;
+const MSG_PAIR_REQUEST = 1;
+const MSG_USE_YOUR_PIN = 2; // 通知对方使用自己的 PIN
+const MSG_PAIR_REJECT = 7; // 拒绝配对请求
+const MSG_CONNECT_REQUEST = 3;
+const MSG_CONNECT_ACCEPT = 4;
+const MSG_ERROR = 6;
+const MSG_SPAKE_DATA = 11;
+const MSG_BLIND_PUBLIC_KEY = 12;
+const MSG_CONNECT_PUBLIC_KEY = 13;
+const MSG_CONNECT_MAC_VER = 14;
+const MSG_SIGNING_PUBLIC_KEY = 15;
 
 // 错误类
 class SConnectError extends Error {
@@ -100,9 +91,7 @@ export class SConnect implements SecureChannel {
 	private signalAdapter: SignalingAdapter;
 	private options: Required<ChannelOptions>;
 	private remoteId = "";
-	private noise: NoiseState | null = null;
-	private sendCipher: ReturnType<typeof createCipher> | null = null;
-	private receiveCipher: ReturnType<typeof createCipher> | null = null;
+	private cipher: cipher | null = null;
 	private PIN = "";
 	private eventHandlers: Map<string, Set<(...args: unknown[]) => void>> =
 		new Map();
@@ -110,10 +99,6 @@ export class SConnect implements SecureChannel {
 	// 状态机
 	private state: ChannelState = "Idle";
 	private handshakeType: HandshakeType = null;
-	private handshakeMessageHandler:
-		| ((type: number, payload: Uint8Array) => void)
-		| null = null;
-	private handshakeMessageQueue: { type: number; payload: Uint8Array }[] = [];
 	private typeMessageQueue: { type: number; payload: Uint8Array }[] = [];
 	private typeMessageResolvers: Map<
 		number,
@@ -175,17 +160,11 @@ export class SConnect implements SecureChannel {
 
 	async tryConnect(credential?: CredentialPrivateInfo): Promise<ConnectResult> {
 		if (this.state !== "Ready") {
-			throw new SConnectError(
-				"CHANNEL_NOT_READY",
-				`Cannot connect in ${this.state} state`,
-			);
+			return { success: false };
 		}
 
 		if (!this.remoteId) {
-			throw new SConnectError(
-				"REMOTE_ID_UNKNOWN",
-				"Remote ID is not known. Try pairing first.",
-			);
+			return { success: false, reason: "NEEDS_PAIRING" };
 		}
 
 		try {
@@ -203,7 +182,12 @@ export class SConnect implements SecureChannel {
 				credential.myPrivateKey
 			) {
 				this.setState("Handshaking", "connect-request");
-				return await this.sendConnectRequest(credential);
+				await this.sendTypeMessage(
+					MSG_CONNECT_REQUEST,
+					new TextEncoder().encode(this.myDeviceId),
+				);
+				const r = (await this.getTypeMessage(MSG_CONNECT_ACCEPT))[0];
+				if (r === 1) return this.connectWithCredential(credential);
 			}
 
 			return { success: false, reason: "NEEDS_PAIRING" };
@@ -214,17 +198,71 @@ export class SConnect implements SecureChannel {
 		}
 	}
 
-	private handleConnectRequest(payload: Uint8Array): void {
-		const senderIdLength = new DataView(
-			payload.buffer,
-			payload.byteOffset,
-		).getUint16(0);
-		const senderId = new TextDecoder().decode(
-			payload.subarray(2, 2 + senderIdLength),
+	private async connectWithCredential(
+		credential: CredentialPrivateInfo,
+	): Promise<ConnectResult> {
+		const eph = await generateKeyPair();
+		const ephSig = await sigh(credential.myPrivateKey, eph.publicKey);
+		const m = concatUint8Arrays([eph.publicKey, ephSig]);
+		await this.sendTypeMessage(MSG_CONNECT_PUBLIC_KEY, m);
+		const otherM = await this.getTypeMessage(MSG_CONNECT_PUBLIC_KEY);
+		const otherPubKey = otherM.subarray(0, eph.publicKey.length);
+		const otherSig = otherM.subarray(eph.publicKey.length);
+		const sigValid = await verifySignature(
+			credential.remotePublicKey,
+			otherPubKey,
+			otherSig,
 		);
+		if (!sigValid) {
+			this.setState("Ready");
+			return { success: false, reason: "NEEDS_PAIRING" };
+		}
+
+		const dhSecret = await dh(eph.privateKey, otherPubKey);
+
+		const info = buildConnectionInfo(
+			this.myDeviceId,
+			this.remoteId,
+			eph.publicKey,
+			otherPubKey,
+		);
+		const derivedKey = await derive(dhSecret, info, new Uint8Array(0));
+		const myMac = await mac(derivedKey, info);
+		await this.sendTypeMessage(MSG_CONNECT_MAC_VER, myMac);
+		const otherMac = await this.getTypeMessage(MSG_CONNECT_MAC_VER);
+
+		const otherInfo = buildConnectionInfo(
+			this.remoteId,
+			this.myDeviceId,
+			otherPubKey,
+			eph.publicKey,
+		);
+		const otherDerivedKey = await derive(
+			dhSecret,
+			otherInfo,
+			new Uint8Array(0),
+		);
+		const otherMacCheck = await mac(otherDerivedKey, otherInfo);
+
+		const macValid = verify(otherMac, otherMacCheck);
+		if (!macValid) {
+			this.setState("Ready");
+			return { success: false, reason: "NEEDS_PAIRING" };
+		}
+
+		if (!this.signalAdapter.supportNativeEncryption) {
+			this.cipher = new cipher(derivedKey, derivedKey);
+		}
+		this.setState("Connected");
+		this.emit("ready");
+		return { success: true, credential: this.buildCredential(credential) };
+	}
+
+	private handleConnectRequest(payload: Uint8Array): void {
+		const senderId = new TextDecoder().decode(payload);
 
 		if (senderId !== this.remoteId) {
-			this.sendHandshakeMessage(MSG_CONNECT_REJECT, new Uint8Array(0)).catch(
+			this.sendTypeMessage(MSG_CONNECT_ACCEPT, new Uint8Array([0])).catch(
 				() => {},
 			);
 			return;
@@ -232,9 +270,9 @@ export class SConnect implements SecureChannel {
 
 		if (!this.connectLimiter.canExecute()) {
 			// todo 提示被频繁占用
-			this.signalAdapter
-				.send(new Uint8Array([MSG_CONNECT_REJECT]))
-				.catch(() => {});
+			this.sendTypeMessage(MSG_CONNECT_ACCEPT, new Uint8Array([0])).catch(
+				() => {},
+			);
 			return;
 		}
 
@@ -242,13 +280,13 @@ export class SConnect implements SecureChannel {
 			remoteDeviceId: senderId,
 			accept: (credential: Credential): Promise<ConnectResult> => {
 				this.setState("Handshaking", "connect-response");
-				this.sendHandshakeMessage(MSG_CONNECT_ACCEPT, new Uint8Array(0)).catch(
+				this.sendTypeMessage(MSG_CONNECT_ACCEPT, new Uint8Array([1])).catch(
 					() => {},
 				);
-				return this.performIKResponder(credential);
+				return this.connectWithCredential(credential);
 			},
 			reject: () => {
-				this.sendHandshakeMessage(MSG_CONNECT_REJECT, new Uint8Array(0)).catch(
+				this.sendTypeMessage(MSG_CONNECT_ACCEPT, new Uint8Array([0])).catch(
 					() => {},
 				);
 			},
@@ -386,13 +424,37 @@ export class SConnect implements SecureChannel {
 			throw new SConnectError("PAIRING_FAILED", "Pairing verification failed");
 		}
 
+		// todo 派生
+		const signingKeyPair = await generateSigningKeyPair();
+		await this.sendTypeMessage(
+			MSG_SIGNING_PUBLIC_KEY,
+			signingKeyPair.publicKey,
+		);
+		const remoteSigningPublicKey = await this.getTypeMessage(
+			MSG_SIGNING_PUBLIC_KEY,
+		);
+
+		if (!remoteSigningPublicKey) {
+			throw new SConnectError(
+				"PAIRING_FAILED",
+				"Failed to receive signing public key",
+			);
+		}
+
+		if (!this.signalAdapter.supportNativeEncryption) {
+			// todo 派生
+			this.cipher = new cipher(
+				await dh(keyPair.privateKey, otherPublicKey),
+				await dh(keyPair.privateKey, otherPublicKey),
+			);
+		}
+
 		this.setState("Connected");
 
 		return {
-			// todo 用S加密轮换新的对
-			myPrivateKey: keyPair.privateKey,
-			myPublicKey: keyPair.publicKey,
-			remotePublicKey: otherPublicKey,
+			myPrivateKey: signingKeyPair.privateKey,
+			myPublicKey: signingKeyPair.publicKey,
+			remotePublicKey: remoteSigningPublicKey,
 			createdAt: Date.now(),
 			myDeviceId: this.myDeviceId,
 			remoteDeviceId: this.remoteId,
@@ -405,9 +467,7 @@ export class SConnect implements SecureChannel {
 			// todo 中间信息攻击，比如useyourpin dos，或者其它，需要状态机限制顺序和个数
 			// todo 提示被频繁占用
 			// todo 其他可能的配对方式
-			this.signalAdapter
-				.send(new Uint8Array([MSG_PAIR_REJECT]))
-				.catch(() => {}); // todo 区分拒绝原因
+			this.sendTypeMessage(MSG_PAIR_REJECT).catch(() => {}); // todo 区分拒绝原因
 			return;
 		}
 
@@ -434,9 +494,7 @@ export class SConnect implements SecureChannel {
 			},
 			reject: () => {
 				// 通知对方配对被拒绝
-				this.signalAdapter
-					.send(new Uint8Array([MSG_PAIR_REJECT]))
-					.catch(() => {});
+				this.sendTypeMessage(MSG_PAIR_REJECT).catch(() => {});
 			},
 		};
 
@@ -448,16 +506,7 @@ export class SConnect implements SecureChannel {
 	disconnect(): void {
 		if (this.state === "Idle") return;
 
-		this.sendCipher = null;
-		this.receiveCipher = null;
-
-		// 清理回调
-		this.onPairReject = null;
-
-		if (this.noise) {
-			destroyNoise(this.noise);
-			this.noise = null;
-		}
+		this.cipher = null;
 
 		this.signalAdapter.close();
 		this.setState("Ready");
@@ -465,13 +514,7 @@ export class SConnect implements SecureChannel {
 	}
 
 	destroy(): void {
-		this.sendCipher = null;
-		this.receiveCipher = null;
-
-		if (this.noise) {
-			destroyNoise(this.noise);
-			this.noise = null;
-		}
+		this.cipher = null;
 
 		this.signalAdapter.close();
 		this.myDeviceId = "";
@@ -506,16 +549,11 @@ export class SConnect implements SecureChannel {
 	}
 
 	private async sendData(data: Uint8Array): Promise<void> {
-		// 添加应用数据类型字节
-		const message = new Uint8Array(1 + data.length);
-		message[0] = MSG_APP_DATA;
-		message.set(data, 1);
-
-		if (this.sendCipher) {
-			const encrypted = this.sendCipher.encrypt(message);
+		if (this.cipher) {
+			const encrypted = await this.cipher.encrypt(data);
 			await this.signalAdapter.send(encrypted);
 		} else {
-			await this.signalAdapter.send(message);
+			await this.signalAdapter.send(data);
 		}
 	}
 
@@ -570,18 +608,6 @@ export class SConnect implements SecureChannel {
 
 	// ================= 计时器管理 =================
 
-	private createTimer(
-		callback: () => void,
-		ms: number,
-	): ReturnType<typeof setTimeout> {
-		const timer = setTimeout(() => {
-			this.activeTimers.delete(timer);
-			callback();
-		}, ms);
-		this.activeTimers.add(timer);
-		return timer;
-	}
-
 	private clearAllTimers(): void {
 		for (const timer of this.activeTimers) {
 			clearTimeout(timer);
@@ -592,133 +618,49 @@ export class SConnect implements SecureChannel {
 	// ================= 消息处理 =================
 
 	private handleRawMessage(data: Uint8Array): void {
-		const type = data[0];
+		if (this.state === "Connected") {
+			this.handleAppData(data).catch(() => {});
+		} else {
+			const type = data[0];
+			const payload = data.subarray(1);
 
-		// 错误消息任何状态都处理
-		if (type === MSG_ERROR) {
-			this.handleErrorFromPeer(data.subarray(1));
-			return;
-		}
+			// 错误消息任何状态都处理
+			if (type === MSG_ERROR) {
+				this.handleErrorFromPeer(payload);
+				return;
+			}
 
-		if (this.state !== "Connected") {
 			const handlers = this.typeMessageResolvers.get(type);
 			if (handlers) {
-				handlers.resolve(data.subarray(1));
+				handlers.resolve(payload);
 			} else {
-				this.typeMessageQueue.push({ type, payload: data.subarray(1) });
+				this.typeMessageQueue.push({ type, payload });
+			}
+
+			switch (this.state) {
+				case "Idle":
+					return;
+
+				case "Ready":
+					switch (type) {
+						case MSG_PAIR_REQUEST:
+							this.handlePairRequest(payload);
+							break;
+						case MSG_CONNECT_REQUEST:
+							this.handleConnectRequest(payload);
+							break;
+					}
+					return;
 			}
 		}
-
-		switch (this.state) {
-			case "Idle":
-				return;
-
-			case "Ready":
-				if (type < 0x20) {
-					this.handleProtocolMessage(data);
-				} else {
-					this.sendErrorToPeer("NOT_CONNECTED", "Peer is not connected");
-				}
-				return;
-
-			case "Handshaking":
-				if (this.isHandshakeMessage(type)) {
-					this.handleHandshakeMessage(data);
-				} else {
-					this.sendErrorToPeer(
-						"UNEXPECTED_MESSAGE",
-						"Peer is in handshake state",
-					);
-				}
-				return;
-
-			case "Connected":
-				// 只拒绝新的配对/连接请求
-				if (type === MSG_PAIR_REQUEST) {
-					this.sendErrorToPeer(
-						"ALREADY_CONNECTED",
-						"Peer is already connected",
-					);
-				} else if (type === MSG_CONNECT_REQUEST) {
-					this.sendErrorToPeer(
-						"ALREADY_CONNECTED",
-						"Peer is already connected",
-					);
-				} else {
-					// 其他都作为应用数据处理（包括协议消息）
-					this.handleAppData(data);
-				}
-				return;
-		}
 	}
 
-	private isHandshakeMessage(type: number): boolean {
-		switch (this.handshakeType) {
-			case "pake":
-				return (
-					type === MSG_APP_DATA ||
-					type === MSG_PAIR_REJECT ||
-					type === MSG_USE_YOUR_PIN ||
-					type === MSG_SPAKE_DATA
-				);
-			case "ik":
-				return type === MSG_NOISE_DATA || type === MSG_APP_DATA;
-			case "connect-request":
-				return type === MSG_CONNECT_ACCEPT || type === MSG_CONNECT_REJECT;
-			case "connect-response":
-				return type === MSG_NOISE_DATA || type === MSG_APP_DATA;
-			default:
-				return false;
-		}
-	}
+	private async handleAppData(data: Uint8Array): Promise<void> {
+		let payload = data;
 
-	private handleHandshakeMessage(data: Uint8Array): void {
-		const type = data[0];
-		const payload = data.subarray(1);
-
-		// 处理配对拒绝消息
-		if (type === MSG_PAIR_REJECT) {
-			this.handlePairReject();
-			return;
-		}
-
-		// 其他握手消息由各握手方法的消息处理器处理
-		if (this.handshakeMessageHandler) {
-			this.handshakeMessageHandler(type, payload);
-		} else {
-			// 如果还未注册处理器（例如正在进行耗时的异步密钥计算），先缓冲消息
-			this.handshakeMessageQueue.push({ type, payload });
-		}
-	}
-
-	private handleProtocolMessage(data: Uint8Array): void {
-		const type = data[0];
-		const payload = data.subarray(1);
-
-		switch (type) {
-			case MSG_PAIR_REQUEST:
-				this.handlePairRequest(payload);
-				break;
-			case MSG_CONNECT_REQUEST:
-				this.handleConnectRequest(payload);
-				break;
-		}
-	}
-
-	private handlePairReject(): void {
-		if (this.onPairReject) {
-			this.onPairReject();
-			this.onPairReject = null;
-		}
-	}
-
-	private handleAppData(data: Uint8Array): void {
-		// 移除类型字节
-		let payload = new Uint8Array(data.subarray(1));
-
-		if (this.receiveCipher) {
+		if (this.cipher) {
 			try {
-				payload = new Uint8Array(this.receiveCipher.decrypt(payload));
+				payload = new Uint8Array(await this.cipher.decrypt(payload));
 			} catch {
 				this.emit("data", new Uint8Array(payload).buffer as ArrayBuffer, () =>
 					this.textDecoder.decode(payload),
@@ -740,19 +682,12 @@ export class SConnect implements SecureChannel {
 			// Not JSON
 		}
 
-		this.emit("data", payload.buffer, () => this.textDecoder.decode(payload));
+		this.emit("data", payload.buffer as ArrayBuffer, () =>
+			this.textDecoder.decode(payload),
+		);
 	}
 
 	// ================= 错误消息 =================
-
-	private sendErrorToPeer(code: string, message: string): void {
-		const errorMsg = JSON.stringify({ code, message });
-		const payload = new TextEncoder().encode(errorMsg);
-		const msg = new Uint8Array(1 + payload.length);
-		msg[0] = MSG_ERROR;
-		msg.set(payload, 1);
-		this.signalAdapter.send(msg).catch(() => {});
-	}
 
 	private handleErrorFromPeer(payload: Uint8Array): void {
 		const text = new TextDecoder().decode(payload);
@@ -764,208 +699,7 @@ export class SConnect implements SecureChannel {
 		}
 	}
 
-	// ================= 配对请求 =================
-
-	// 当前配对请求的回调函数，用于处理 MSG_PAIR_REJECT 消息
-	private onPairReject: (() => void) | null = null;
-
-	// ================= 连接请求 =================
-
-	private async sendConnectRequest(
-		credential: CredentialPrivateInfo,
-	): Promise<ConnectResult> {
-		return new Promise((resolve, reject) => {
-			const timeout = this.createTimer(() => {
-				this.restoreMessageHandler();
-				this.setState("Ready");
-				this.sendErrorToPeer("TIMEOUT", "Connect request timeout");
-				reject(new SConnectError("TIMEOUT", "Connect request timeout"));
-			}, this.options.connectTimeout);
-
-			const messageHandler = (type: number, _payload: Uint8Array) => {
-				if (type === MSG_CONNECT_ACCEPT) {
-					clearTimeout(timeout);
-					this.activeTimers.delete(timeout);
-					this.restoreMessageHandler();
-					this.setState("Handshaking", "ik");
-					this.performIKInitiator(credential).then(resolve).catch(reject);
-				} else if (type === MSG_CONNECT_REJECT) {
-					clearTimeout(timeout);
-					this.activeTimers.delete(timeout);
-					this.restoreMessageHandler();
-					this.setState("Ready");
-					resolve({ success: false });
-				}
-			};
-
-			this.setHandshakeMessageHandler(messageHandler);
-
-			const myIdBytes = new TextEncoder().encode(this.myDeviceId);
-			const message = new Uint8Array(1 + 2 + myIdBytes.length);
-			message[0] = MSG_CONNECT_REQUEST;
-			new DataView(message.buffer).setUint16(1, myIdBytes.length);
-			message.set(myIdBytes, 3);
-
-			this.signalAdapter.send(message).catch((err) => {
-				clearTimeout(timeout);
-				this.activeTimers.delete(timeout);
-				this.restoreMessageHandler();
-				this.setState("Ready");
-				reject(err);
-			});
-		});
-	}
-
-	// ================= Noise IK =================
-
-	private async performIKInitiator(
-		credential: CredentialPrivateInfo,
-	): Promise<ConnectResult> {
-		try {
-			this.noise = createNoise("IK", true, {
-				privateKey: credential.myPrivateKey,
-				publicKey: credential.myPublicKey,
-			});
-			initialiseNoise(
-				this.noise,
-				new Uint8Array(0),
-				credential.remotePublicKey,
-			);
-
-			const handshakeMessage = sendNoise(this.noise);
-
-			const responsePromise = this.waitForNoiseResponse();
-
-			this.sendHandshakeMessage(MSG_NOISE_DATA, handshakeMessage).catch(
-				() => {},
-			);
-
-			const response = await responsePromise;
-			recvNoise(this.noise, response);
-
-			if (this.noise.complete) {
-				if (!this.signalAdapter.supportNativeEncryption) {
-					this.sendCipher = createCipher(this.noise.tx);
-					this.receiveCipher = createCipher(this.noise.rx);
-				}
-
-				this.setState("Connected");
-				this.emit("ready");
-				return {
-					success: true,
-					credential: this.buildCredential(credential),
-				};
-			}
-
-			this.setState("Ready");
-			return { success: false };
-		} catch {
-			this.setState("Ready");
-			this.emit(
-				"error",
-				new SConnectError("IK_HANDSHAKE_FAILED", "Noise IK handshake failed"),
-			);
-			return { success: false };
-		}
-	}
-
-	private async performIKResponder(
-		credential: CredentialPrivateInfo,
-	): Promise<ConnectResult> {
-		return new Promise((resolve, reject) => {
-			const timeout = this.createTimer(() => {
-				this.restoreMessageHandler();
-				this.setState("Ready");
-				this.sendErrorToPeer("TIMEOUT", "IK handshake timeout");
-				reject(new SConnectError("TIMEOUT", "IK handshake timeout"));
-			}, this.options.handshakeTimeout);
-
-			const messageHandler = (type: number, payload: Uint8Array) => {
-				if (type !== MSG_NOISE_DATA) return;
-				try {
-					this.noise = createNoise("IK", false, {
-						privateKey: credential.myPrivateKey,
-						publicKey: credential.myPublicKey,
-					});
-					initialiseNoise(this.noise, new Uint8Array(0));
-					recvNoise(this.noise, payload);
-
-					const responseMsg = sendNoise(this.noise);
-					this.sendHandshakeMessage(MSG_NOISE_DATA, responseMsg).catch(
-						() => {},
-					);
-
-					if (this.noise.complete) {
-						if (!this.signalAdapter.supportNativeEncryption) {
-							this.sendCipher = createCipher(this.noise.tx);
-							this.receiveCipher = createCipher(this.noise.rx);
-						}
-
-						this.setState("Connected");
-						this.activeTimers.delete(timeout);
-						clearTimeout(timeout);
-						this.restoreMessageHandler();
-						this.emit("ready");
-						resolve({
-							success: true,
-							credential: this.buildCredential(credential),
-						});
-					} else {
-						this.activeTimers.delete(timeout);
-						clearTimeout(timeout);
-						this.setState("Ready");
-						resolve({ success: false });
-					}
-				} catch {
-					this.activeTimers.delete(timeout);
-					clearTimeout(timeout);
-					this.restoreMessageHandler();
-					this.setState("Ready");
-					reject(
-						new SConnectError(
-							"IK_HANDSHAKE_FAILED",
-							"Noise IK handshake failed",
-						),
-					);
-				}
-			};
-
-			this.setHandshakeMessageHandler(messageHandler);
-		});
-	}
-
-	private waitForNoiseResponse(): Promise<Uint8Array> {
-		return new Promise((resolve, reject) => {
-			const timeout = this.createTimer(() => {
-				this.restoreMessageHandler();
-				this.setState("Ready");
-				this.sendErrorToPeer("TIMEOUT", "Noise handshake timeout");
-				reject(new SConnectError("TIMEOUT", "Noise handshake timeout"));
-			}, this.options.handshakeTimeout);
-
-			const handler = (type: number, payload: Uint8Array) => {
-				if (type !== MSG_NOISE_DATA) return;
-				this.activeTimers.delete(timeout);
-				clearTimeout(timeout);
-				this.restoreMessageHandler();
-				resolve(payload);
-			};
-
-			this.setHandshakeMessageHandler(handler);
-		});
-	}
-
 	// ================= 工具方法 =================
-
-	private async sendHandshakeMessage(
-		type: number,
-		payload: Uint8Array,
-	): Promise<void> {
-		const message = new Uint8Array(1 + payload.length);
-		message[0] = type;
-		message.set(payload, 1);
-		await this.signalAdapter.send(message);
-	}
 
 	private async sendTypeMessage(
 		type: number,
@@ -1000,24 +734,6 @@ export class SConnect implements SecureChannel {
 		return p.promise;
 	}
 
-	private setHandshakeMessageHandler(
-		handler: (type: number, payload: Uint8Array) => void,
-	): void {
-		this.handshakeMessageHandler = handler;
-		// 处理已经排队的消息
-		while (this.handshakeMessageQueue.length > 0) {
-			const msg = this.handshakeMessageQueue.shift();
-			if (msg) {
-				handler(msg.type, msg.payload);
-			}
-		}
-	}
-
-	private restoreMessageHandler(): void {
-		this.handshakeMessageHandler = null;
-		this.handshakeMessageQueue = [];
-	}
-
 	private buildCredential(
 		credential: CredentialPrivateInfo | undefined,
 	): Credential {
@@ -1035,8 +751,7 @@ export class SConnect implements SecureChannel {
 
 	private handleDisconnect(): void {
 		if (this.state === "Idle") return;
-		this.sendCipher = null;
-		this.receiveCipher = null;
+		this.cipher = null;
 		this.setState("Ready");
 		this.emit("disconnect");
 	}
@@ -1096,6 +811,87 @@ export async function generateKeyPair(): Promise<KeyPair> {
 	};
 }
 
+export async function generateSigningKeyPair(): Promise<KeyPair> {
+	const keyPair = await crypto.subtle.generateKey("Ed25519", true, [
+		"sign",
+		"verify",
+	]);
+	const publicKeyBuffer = await crypto.subtle.exportKey(
+		"raw",
+		(keyPair as CryptoKeyPair).publicKey,
+	);
+	const privateKeyBuffer = await crypto.subtle.exportKey(
+		"pkcs8",
+		(keyPair as CryptoKeyPair).privateKey,
+	);
+	return {
+		publicKey: new Uint8Array(publicKeyBuffer),
+		privateKey: new Uint8Array(privateKeyBuffer).subarray(16),
+	};
+}
+
+export class cipher {
+	private sendCryptoKey: CryptoKey | null = null;
+	private receiveCryptoKey: CryptoKey | null = null;
+
+	constructor(
+		private sendKey: Uint8Array,
+		private receiveKey: Uint8Array,
+	) {}
+
+	private async getSendKey(): Promise<CryptoKey> {
+		if (!this.sendCryptoKey) {
+			this.sendCryptoKey = await crypto.subtle.importKey(
+				"raw",
+				this.sendKey as unknown as BufferSource,
+				{ name: "AES-GCM" },
+				false,
+				["encrypt"],
+			);
+		}
+		return this.sendCryptoKey;
+	}
+
+	private async getReceiveKey(): Promise<CryptoKey> {
+		if (!this.receiveCryptoKey) {
+			this.receiveCryptoKey = await crypto.subtle.importKey(
+				"raw",
+				this.receiveKey as unknown as BufferSource,
+				{ name: "AES-GCM" },
+				false,
+				["decrypt"],
+			);
+		}
+		return this.receiveCryptoKey;
+	}
+
+	async encrypt(data: Uint8Array): Promise<Uint8Array> {
+		const key = await this.getSendKey();
+		const iv = crypto.getRandomValues(new Uint8Array(12));
+		const encrypted = await crypto.subtle.encrypt(
+			{ name: "AES-GCM", iv },
+			key,
+			data as unknown as BufferSource,
+		);
+		const result = new Uint8Array(iv.length + encrypted.byteLength);
+		result.set(iv);
+		result.set(new Uint8Array(encrypted), iv.length);
+		return result;
+	}
+
+	async decrypt(data: Uint8Array): Promise<Uint8Array> {
+		const key = await this.getReceiveKey();
+		const iv = new Uint8Array(data.buffer, data.byteOffset, 12);
+		const ciphertext = new Uint8Array(data.buffer, data.byteOffset + 12);
+		const decrypted = await crypto.subtle.decrypt(
+			{ name: "AES-GCM", iv: iv as unknown as BufferSource },
+			key,
+			ciphertext as unknown as BufferSource,
+		);
+		return new Uint8Array(decrypted);
+	}
+}
+
 // todo 更安全做法
 export function blind(pin: string, publicKey: Uint8Array): Uint8Array {
 	// 将 PIN 转换为 Uint8Array
@@ -1133,7 +929,7 @@ export async function dh(
 ): Promise<Uint8Array> {
 	const privKey = await crypto.subtle.importKey(
 		"pkcs8",
-		buildPkcs8(privateKey),
+		buildX25519Pkcs8(privateKey),
 		"X25519",
 		false,
 		["deriveBits"],
@@ -1153,9 +949,20 @@ export async function dh(
 	return new Uint8Array(bits);
 }
 
-function buildPkcs8(rawPrivKey: Uint8Array): ArrayBuffer {
+function buildX25519Pkcs8(rawPrivKey: Uint8Array): ArrayBuffer {
 	const header = new Uint8Array([
 		0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x6e,
+		0x04, 0x22, 0x04, 0x20,
+	]);
+	const buf = new Uint8Array(header.length + rawPrivKey.length);
+	buf.set(header, 0);
+	buf.set(rawPrivKey, header.length);
+	return buf.buffer;
+}
+
+function buildEd25519Pkcs8(rawPrivKey: Uint8Array): ArrayBuffer {
+	const header = new Uint8Array([
+		0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70,
 		0x04, 0x22, 0x04, 0x20,
 	]);
 	const buf = new Uint8Array(header.length + rawPrivKey.length);
@@ -1233,4 +1040,71 @@ function verify(key: Uint8Array, key2: Uint8Array) {
 	let diff = 0;
 	for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
 	return diff === 0;
+}
+
+function concatUint8Arrays(arrays: Uint8Array[]): Uint8Array {
+	const totalLength = arrays.reduce((sum, arr) => sum + arr.length, 0);
+	const result = new Uint8Array(totalLength);
+	let offset = 0;
+	for (const arr of arrays) {
+		result.set(arr, offset);
+		offset += arr.length;
+	}
+	return result;
+}
+
+export async function sigh(
+	privateKey: Uint8Array,
+	data: Uint8Array,
+): Promise<Uint8Array> {
+	const key = await crypto.subtle.importKey(
+		"pkcs8",
+		buildEd25519Pkcs8(privateKey),
+		"Ed25519",
+		false,
+		["sign"],
+	);
+	const sig = await crypto.subtle.sign(
+		"Ed25519",
+		key,
+		data as unknown as BufferSource,
+	);
+	return new Uint8Array(sig);
+}
+
+export async function verifySignature(
+	publicKey: Uint8Array,
+	data: Uint8Array,
+	signature: Uint8Array,
+): Promise<boolean> {
+	const key = await crypto.subtle.importKey(
+		"raw",
+		publicKey as unknown as BufferSource,
+		"Ed25519",
+		false,
+		["verify"],
+	);
+	return crypto.subtle.verify(
+		"Ed25519",
+		key,
+		signature as unknown as BufferSource,
+		data as unknown as BufferSource,
+	);
+}
+
+function buildConnectionInfo(
+	localId: string,
+	remoteId: string,
+	localEphemeralPk: Uint8Array,
+	remoteEphemeralPk: Uint8Array,
+): ArrayBuffer {
+	const enc = new TextEncoder();
+	const localIdBytes = enc.encode(localId);
+	const remoteIdBytes = enc.encode(remoteId);
+	return concatUint8Arrays([
+		localIdBytes,
+		remoteIdBytes,
+		localEphemeralPk,
+		remoteEphemeralPk,
+	]).buffer as ArrayBuffer;
 }

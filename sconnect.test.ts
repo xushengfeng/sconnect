@@ -1,5 +1,15 @@
 import { describe, it, expect } from "vitest";
-import { blind, deBlind, dh, generateKeyPair, SConnect } from "./sconnect";
+import {
+	blind,
+	cipher,
+	deBlind,
+	dh,
+	generateKeyPair,
+	generateSigningKeyPair,
+	SConnect,
+	sigh,
+	verifySignature,
+} from "./sconnect";
 import { LoopbackAdapter, UntrustedLoopbackAdapter } from "./loopback_adapter";
 import type { ConnectRequest, PairRequest } from "./sconnect_type";
 
@@ -68,10 +78,7 @@ describe("SConnect", () => {
 
 			// 原始数据包含类型字节（0x20 = MSG_APP_DATA）
 			expect(rawSentData).not.toBeNull();
-			expect(rawSentData![0]).toBe(0x20); // 应用数据类型
-			expect(new TextDecoder().decode(rawSentData!.subarray(1))).toBe(
-				testMessage,
-			);
+			expect(new TextDecoder().decode(rawSentData!)).toBe(testMessage);
 			expect(receivedMessages).toContain(testMessage);
 
 			channelA.disconnect();
@@ -170,6 +177,8 @@ describe("SConnect", () => {
 
 			expect(credentialA).toBeDefined();
 			expect(credentialB).toBeDefined();
+			expect(credentialA.myPublicKey).toEqual(credentialB.remotePublicKey);
+			expect(credentialB.myPublicKey).toEqual(credentialA.remotePublicKey);
 
 			// 配对后应该能收发消息
 			await channelA.send("hello after pairing");
@@ -226,6 +235,8 @@ describe("SConnect", () => {
 
 			expect(credentialA).toBeDefined();
 			expect(credentialB).toBeDefined();
+			expect(credentialA.myPublicKey).toEqual(credentialB.remotePublicKey);
+			expect(credentialB.myPublicKey).toEqual(credentialA.remotePublicKey);
 
 			// 配对后应该能收发消息
 			await channelA.send("hello after pairing");
@@ -360,10 +371,7 @@ describe("SConnect", () => {
 			await new Promise((r) => setTimeout(r, 100));
 
 			expect(rawSentData).not.toBeNull();
-			expect(rawSentData![0]).toBe(0x20);
-			expect(new TextDecoder().decode(rawSentData!.subarray(1))).toBe(
-				testMessage,
-			);
+			expect(new TextDecoder().decode(rawSentData!)).toBe(testMessage);
 			expect(receivedMessages).toContain(testMessage);
 
 			channelA.disconnect();
@@ -375,8 +383,8 @@ describe("SConnect", () => {
 		it("有 Credential 时 tryConnect 应触发 connectRequest 事件", async () => {
 			// 第一次配对
 
-			const keyPairA = await generateKeyPair();
-			const keyPairB = await generateKeyPair();
+			const keyPairA = await generateSigningKeyPair();
+			const keyPairB = await generateSigningKeyPair();
 
 			// 第二次重连
 			const [adapterA2, adapterB2] = UntrustedLoopbackAdapter.createPair();
@@ -405,12 +413,48 @@ describe("SConnect", () => {
 			const connectRequest = await connectRequestPromise;
 			expect(connectRequest.remoteDeviceId).toBe("device-a");
 
+			channelA2.disconnect();
+			channelB2.disconnect();
+		});
+
+		it("连接", async () => {
+			// 第一次配对
+
+			const keyPairA = await generateSigningKeyPair();
+			const keyPairB = await generateSigningKeyPair();
+
+			// 第二次重连
+			const [adapterA2, adapterB2] = UntrustedLoopbackAdapter.createPair();
+			const channelA2 = new SConnect(adapterA2, { handshakeTimeout: 10000 });
+			const channelB2 = new SConnect(adapterB2, { handshakeTimeout: 10000 });
+
+			await channelA2.init("device-a", "device-b");
+			await channelB2.init("device-b", "device-a");
+
+			// B 监听连接请求
+			const connectRequestPromise = new Promise<ConnectRequest>((resolve) => {
+				channelB2.on("connectRequest", (request) => {
+					resolve(request);
+				});
+			});
+
+			// A 发起连接
+			const resultAPromise = channelA2.tryConnect({
+				createdAt: Date.now(),
+				myPrivateKey: keyPairA.privateKey,
+				myPublicKey: keyPairA.publicKey,
+				remotePublicKey: keyPairB.publicKey,
+			});
+
+			// 等待 B 收到连接请求
+			const connectRequest = await connectRequestPromise;
+
 			// B 接受连接
 			const resultBPromise = connectRequest.accept({
 				createdAt: Date.now(),
 				myPrivateKey: keyPairB.privateKey,
-				remotePublicKey: keyPairA.publicKey,
 				myPublicKey: keyPairB.publicKey,
+				remotePublicKey: keyPairA.publicKey,
 				myDeviceId: "device-b",
 				remoteDeviceId: "device-a",
 			});
@@ -430,8 +474,8 @@ describe("SConnect", () => {
 		it("B 可以拒绝连接请求", async () => {
 			// 第一次配对
 
-			const keyPairA = await generateKeyPair();
-			const keyPairB = await generateKeyPair();
+			const keyPairA = await generateSigningKeyPair();
+			const keyPairB = await generateSigningKeyPair();
 
 			// 第二次重连 - B 拒绝
 			const [adapterA2, adapterB2] = UntrustedLoopbackAdapter.createPair();
@@ -472,8 +516,8 @@ describe("SConnect", () => {
 
 		it("init没有记录时重连失效", async () => {
 			// 第一次配对
-			const keyPairA = await generateKeyPair();
-			const keyPairB = await generateKeyPair();
+			const keyPairA = await generateSigningKeyPair();
+			const keyPairB = await generateSigningKeyPair();
 
 			// 第二次重连 - B 自动拒绝
 			const [adapterA2, adapterB2] = UntrustedLoopbackAdapter.createPair();
@@ -501,8 +545,8 @@ describe("SConnect", () => {
 
 		it("重连后应能收发消息", async () => {
 			// 第一次配对
-			const keyPairA = await generateKeyPair();
-			const keyPairB = await generateKeyPair();
+			const keyPairA = await generateSigningKeyPair();
+			const keyPairB = await generateSigningKeyPair();
 
 			// 第二次重连
 			const [adapterA2, adapterB2] = UntrustedLoopbackAdapter.createPair();
@@ -726,5 +770,76 @@ describe("密码学验证", () => {
 		const blinded = blind(pin, keyPair.publicKey);
 		const deblinded = deBlind(blinded, pin);
 		expect(deblinded).toEqual(keyPair.publicKey);
+	});
+	it("签名验证", async () => {
+		const keyPair = await generateSigningKeyPair();
+		const data = new TextEncoder().encode("test data");
+		const signature = await sigh(keyPair.privateKey, data);
+		const isValid = await verifySignature(keyPair.publicKey, data, signature);
+		expect(isValid).toBe(true);
+	});
+
+	describe("AES-GCM 加密解密", () => {
+		it("AES-GCM 加密解密", async () => {
+			const key = crypto.getRandomValues(new Uint8Array(32));
+			const c = new cipher(key, key);
+
+			const plaintext = new TextEncoder().encode("hello world");
+			const encrypted = await c.encrypt(plaintext);
+			const decrypted = await c.decrypt(encrypted);
+
+			expect(decrypted).toEqual(plaintext);
+			expect(encrypted).not.toEqual(plaintext);
+		});
+
+		it("AES-GCM 加密输出包含 IV", async () => {
+			const key = crypto.getRandomValues(new Uint8Array(32));
+			const c = new cipher(key, key);
+
+			const plaintext = new TextEncoder().encode("test");
+			const encrypted = await c.encrypt(plaintext);
+
+			// IV (12) + ciphertext (16 minimum for AES-GCM)
+			expect(encrypted.length).toBeGreaterThanOrEqual(28);
+		});
+
+		it("AES-GCM 不同密钥解密失败", async () => {
+			const key1 = crypto.getRandomValues(new Uint8Array(32));
+			const key2 = crypto.getRandomValues(new Uint8Array(32));
+			const c1 = new cipher(key1, key1);
+			const c2 = new cipher(key2, key2);
+
+			const plaintext = new TextEncoder().encode("secret");
+			const encrypted = await c1.encrypt(plaintext);
+
+			await expect(c2.decrypt(encrypted)).rejects.toThrow();
+		});
+
+		it("AES-GCM 二进制数据加密解密", async () => {
+			const key = crypto.getRandomValues(new Uint8Array(32));
+			const c = new cipher(key, key);
+
+			const binaryData = new Uint8Array([0, 1, 2, 255, 254, 253]);
+			const encrypted = await c.encrypt(binaryData);
+			const decrypted = await c.decrypt(encrypted);
+
+			expect(decrypted).toEqual(binaryData);
+		});
+
+		it("AES-GCM sendKey 和 receiveKey 不同", async () => {
+			const sendKey = crypto.getRandomValues(new Uint8Array(32));
+			const receiveKey = crypto.getRandomValues(new Uint8Array(32));
+			const c = new cipher(sendKey, receiveKey);
+
+			// 使用 sendKey 加密，receiveKey 解密会失败（因为密钥不同）
+			const plaintext = new TextEncoder().encode("test");
+			const encrypted = await c.encrypt(plaintext);
+
+			// 创建另一个 cipher，交换 sendKey 和 receiveKey
+			const c2 = new cipher(receiveKey, sendKey);
+			const decrypted = await c2.decrypt(encrypted);
+
+			expect(decrypted).toEqual(plaintext);
+		});
 	});
 });
