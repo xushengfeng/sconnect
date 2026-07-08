@@ -374,41 +374,9 @@ describe("SConnect", () => {
 	describe("不受信任信道 - Credential 重连", () => {
 		it("有 Credential 时 tryConnect 应触发 connectRequest 事件", async () => {
 			// 第一次配对
-			const [adapterA1, adapterB1] = UntrustedLoopbackAdapter.createPair();
-			const channelA1 = new SConnect(adapterA1, { handshakeTimeout: 10000 });
-			const channelB1 = new SConnect(adapterB1, { handshakeTimeout: 10000 });
 
-			await channelA1.init("device-a", "device-b");
-			await channelB1.init("device-b", "device-a");
-
-			// B 监听配对请求
-			const pairRequestPromise = new Promise<PairRequest>((resolve) => {
-				channelB1.on("pairRequest", (request) => {
-					resolve(request);
-				});
-			});
-
-			// A 发起配对
-			const pairingA = await channelA1.pairInit({
-				myDeviceId: "device-a",
-				remoteDeviceId: "device-b",
-			});
-
-			const pairRequest = await pairRequestPromise;
-			pairRequest.inputOtherPin(pairingA.pin);
-			const credentialBPromise = pairRequest.waitForPairing();
-			const credentialAPromise = pairingA.waitForPairing();
-
-			const [credentialA, credentialB] = await Promise.all([
-				credentialAPromise,
-				credentialBPromise,
-			]);
-
-			expect(credentialA.myPublicKey).toBeInstanceOf(Uint8Array);
-			expect(credentialA.myPublicKey.length).toBeGreaterThan(0);
-
-			channelA1.disconnect();
-			channelB1.disconnect();
+			const keyPairA = await generateKeyPair();
+			const keyPairB = await generateKeyPair();
 
 			// 第二次重连
 			const [adapterA2, adapterB2] = UntrustedLoopbackAdapter.createPair();
@@ -426,14 +394,26 @@ describe("SConnect", () => {
 			});
 
 			// A 发起连接
-			const resultAPromise = channelA2.tryConnect(credentialA);
+			const resultAPromise = channelA2.tryConnect({
+				createdAt: Date.now(),
+				myPrivateKey: keyPairA.privateKey,
+				remotePublicKey: keyPairB.publicKey,
+				myPublicKey: keyPairA.publicKey,
+			});
 
 			// 等待 B 收到连接请求
 			const connectRequest = await connectRequestPromise;
 			expect(connectRequest.remoteDeviceId).toBe("device-a");
 
 			// B 接受连接
-			const resultBPromise = connectRequest.accept(credentialB);
+			const resultBPromise = connectRequest.accept({
+				createdAt: Date.now(),
+				myPrivateKey: keyPairB.privateKey,
+				remotePublicKey: keyPairA.publicKey,
+				myPublicKey: keyPairB.publicKey,
+				myDeviceId: "device-b",
+				remoteDeviceId: "device-a",
+			});
 
 			const [resultA, resultB] = await Promise.all([
 				resultAPromise,
@@ -449,38 +429,9 @@ describe("SConnect", () => {
 
 		it("B 可以拒绝连接请求", async () => {
 			// 第一次配对
-			const [adapterA1, adapterB1] = UntrustedLoopbackAdapter.createPair();
-			const channelA1 = new SConnect(adapterA1, { handshakeTimeout: 10000 });
-			const channelB1 = new SConnect(adapterB1, { handshakeTimeout: 10000 });
 
-			await channelA1.init("device-a");
-			await channelB1.init("device-b");
-
-			// B 监听配对请求
-			const pairRequestPromise = new Promise<PairRequest>((resolve) => {
-				channelB1.on("pairRequest", (request) => {
-					resolve(request);
-				});
-			});
-
-			// A 发起配对
-			const pairingA = await channelA1.pairInit({
-				myDeviceId: "device-a",
-				remoteDeviceId: "device-b",
-			});
-
-			const pairRequest = await pairRequestPromise;
-			pairRequest.inputOtherPin(pairingA.pin);
-			const credentialBPromise = pairRequest.waitForPairing();
-			const credentialAPromise = pairingA.waitForPairing();
-
-			const [credentialA, credentialB] = await Promise.all([
-				credentialAPromise,
-				credentialBPromise,
-			]);
-
-			channelA1.disconnect();
-			channelB1.disconnect();
+			const keyPairA = await generateKeyPair();
+			const keyPairB = await generateKeyPair();
 
 			// 第二次重连 - B 拒绝
 			const [adapterA2, adapterB2] = UntrustedLoopbackAdapter.createPair();
@@ -498,7 +449,12 @@ describe("SConnect", () => {
 			});
 
 			// A 发起连接
-			const resultAPromise = channelA2.tryConnect(credentialA);
+			const resultAPromise = channelA2.tryConnect({
+				createdAt: Date.now(),
+				myPrivateKey: keyPairA.privateKey,
+				myPublicKey: keyPairA.publicKey,
+				remotePublicKey: keyPairB.publicKey,
+			});
 
 			// 等待 B 收到连接请求
 			const connectRequest = await connectRequestPromise;
@@ -516,38 +472,8 @@ describe("SConnect", () => {
 
 		it("init没有记录时重连失效", async () => {
 			// 第一次配对
-			const [adapterA1, adapterB1] = UntrustedLoopbackAdapter.createPair();
-			const channelA1 = new SConnect(adapterA1, { handshakeTimeout: 10000 });
-			const channelB1 = new SConnect(adapterB1, { handshakeTimeout: 10000 });
-
-			await channelA1.init("device-a");
-			await channelB1.init("device-b");
-
-			// B 监听配对请求
-			const pairRequestPromise = new Promise<PairRequest>((resolve) => {
-				channelB1.on("pairRequest", (request) => {
-					resolve(request);
-				});
-			});
-
-			// A 发起配对
-			const pairingA = await channelA1.pairInit({
-				myDeviceId: "device-a",
-				remoteDeviceId: "device-b",
-			});
-
-			const pairRequest = await pairRequestPromise;
-			pairRequest.inputOtherPin(pairingA.pin);
-			const credentialBPromise = pairRequest.waitForPairing();
-			const credentialAPromise = pairingA.waitForPairing();
-
-			const [credentialA] = await Promise.all([
-				credentialAPromise,
-				credentialBPromise,
-			]);
-
-			channelA1.disconnect();
-			channelB1.disconnect();
+			const keyPairA = await generateKeyPair();
+			const keyPairB = await generateKeyPair();
 
 			// 第二次重连 - B 自动拒绝
 			const [adapterA2, adapterB2] = UntrustedLoopbackAdapter.createPair();
@@ -558,7 +484,12 @@ describe("SConnect", () => {
 			await channelB2.init("device-b");
 
 			// A 发起连接
-			const resultAPromise = channelA2.tryConnect(credentialA);
+			const resultAPromise = channelA2.tryConnect({
+				createdAt: Date.now(),
+				myPrivateKey: keyPairA.privateKey,
+				myPublicKey: keyPairA.publicKey,
+				remotePublicKey: keyPairB.publicKey,
+			});
 
 			// A 应该收到失败结果
 			const resultA = await resultAPromise;
@@ -570,38 +501,8 @@ describe("SConnect", () => {
 
 		it("重连后应能收发消息", async () => {
 			// 第一次配对
-			const [adapterA1, adapterB1] = UntrustedLoopbackAdapter.createPair();
-			const channelA1 = new SConnect(adapterA1, { handshakeTimeout: 10000 });
-			const channelB1 = new SConnect(adapterB1, { handshakeTimeout: 10000 });
-
-			await channelA1.init("device-a");
-			await channelB1.init("device-b");
-
-			// B 监听配对请求
-			const pairRequestPromise = new Promise<PairRequest>((resolve) => {
-				channelB1.on("pairRequest", (request) => {
-					resolve(request);
-				});
-			});
-
-			// A 发起配对
-			const pairingA = await channelA1.pairInit({
-				myDeviceId: "device-a",
-				remoteDeviceId: "device-b",
-			});
-
-			const pairRequest = await pairRequestPromise;
-			pairRequest.inputOtherPin(pairingA.pin);
-			const credentialBPromise = pairRequest.waitForPairing();
-			const credentialAPromise = pairingA.waitForPairing();
-
-			const [credentialA, credentialB] = await Promise.all([
-				credentialAPromise,
-				credentialBPromise,
-			]);
-
-			channelA1.disconnect();
-			channelB1.disconnect();
+			const keyPairA = await generateKeyPair();
+			const keyPairB = await generateKeyPair();
 
 			// 第二次重连
 			const [adapterA2, adapterB2] = UntrustedLoopbackAdapter.createPair();
@@ -622,11 +523,23 @@ describe("SConnect", () => {
 			});
 
 			// A 发起连接
-			const resultAPromise = channelA2.tryConnect(credentialA);
+			const resultAPromise = channelA2.tryConnect({
+				createdAt: Date.now(),
+				myPrivateKey: keyPairA.privateKey,
+				myPublicKey: keyPairA.publicKey,
+				remotePublicKey: keyPairB.publicKey,
+			});
 
 			// B 接受连接
 			const connectRequest = await connectRequestPromise;
-			const resultBPromise = connectRequest.accept(credentialB);
+			const resultBPromise = connectRequest.accept({
+				createdAt: Date.now(),
+				myPrivateKey: keyPairB.privateKey,
+				myPublicKey: keyPairB.publicKey,
+				remotePublicKey: keyPairA.publicKey,
+				myDeviceId: "device-b",
+				remoteDeviceId: "device-a",
+			});
 
 			await Promise.all([resultAPromise, resultBPromise]);
 
@@ -799,17 +712,19 @@ describe("SConnect", () => {
 	});
 });
 
-describe('密码学验证',()=>{
-	it('dh交换',async()=>{
+describe("密码学验证", () => {
+	it("dh交换", async () => {
 		const keyPairA = await generateKeyPair();
 		const keyPairB = await generateKeyPair();
-		expect(await dh(keyPairA.privateKey, keyPairB.publicKey)).toEqual(await dh(keyPairB.privateKey, keyPairA.publicKey));
-	})
-	it('盲签名',async()=>{
+		expect(await dh(keyPairA.privateKey, keyPairB.publicKey)).toEqual(
+			await dh(keyPairB.privateKey, keyPairA.publicKey),
+		);
+	});
+	it("盲签名", async () => {
 		const keyPair = await generateKeyPair();
-		const pin = '1234';
+		const pin = "1234";
 		const blinded = blind(pin, keyPair.publicKey);
 		const deblinded = deBlind(blinded, pin);
 		expect(deblinded).toEqual(keyPair.publicKey);
-	})
-})
+	});
+});

@@ -166,7 +166,7 @@ export class SConnect implements SecureChannel {
 		}
 		await this.signalAdapter.init(myDeviceId);
 
-		this.myKeyPair = await this.generateKeyPair();
+		this.myKeyPair = await generateKeyPair();
 
 		this.setState("Ready");
 	}
@@ -1071,28 +1071,6 @@ export class SConnect implements SecureChannel {
 			"ADAPTER_ERROR",
 			error instanceof Error ? error.message : String(error),
 		);
-	}
-
-	private async generateKeyPair(): Promise<KeyPair> {
-		const keyPair = await crypto.subtle.generateKey(
-			{ name: "X25519" } as AlgorithmIdentifier,
-			true,
-			["deriveBits"],
-		);
-
-		const publicKeyBuffer = await crypto.subtle.exportKey(
-			"raw",
-			(keyPair as CryptoKeyPair).publicKey,
-		);
-		const privateKeyBuffer = await crypto.subtle.exportKey(
-			"pkcs8",
-			(keyPair as CryptoKeyPair).privateKey,
-		);
-
-		return {
-			publicKey: new Uint8Array(publicKeyBuffer),
-			privateKey: new Uint8Array(privateKeyBuffer).subarray(16),
-		};
 	}
 }
 
