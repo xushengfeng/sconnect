@@ -12,45 +12,14 @@
 
 ## 快速开始
 
-### 1. 受信任信道（如本地 IPC）
+### 不受信任信道（如网络）- PAKE 配对
 
 ```typescript
 import { SConnect } from "myde-remote-connect/sconnect";
-import { LoopbackAdapter } from "myde-remote-connect/loopback_adapter";
+import { UntrustedLoopbackAdapterManager } from "myde-remote-connect/loopback_adapter";
 
 // 创建适配器对
-const [adapterA, adapterB] = LoopbackAdapter.createPair();
-
-// 创建通道实例
-const channelA = new SConnect(adapterA);
-const channelB = new SConnect(adapterB);
-
-// 初始化设备身份
-await channelA.init("device-a", "device-b");
-await channelB.init("device-b", "device-a");
-
-// 建立连接
-const result = await channelA.tryConnect();
-
-if (result.success) {
-    // 发送消息
-    await channelA.send("Hello, Device B!");
-
-    // 接收消息
-    channelB.on("message", (payload) => {
-        console.log("Received:", payload);
-    });
-}
-```
-
-### 2. 不受信任信道（如网络）- PAKE 配对
-
-```typescript
-import { SConnect } from "myde-remote-connect/sconnect";
-import { UntrustedLoopbackAdapter } from "myde-remote-connect/loopback_adapter";
-
-// 创建适配器对
-const [adapterA, adapterB] = UntrustedLoopbackAdapter.createPair();
+const [adapterA, adapterB] = UntrustedLoopbackAdapterManager.createPair();
 
 // 创建通道实例
 const channelA = new SConnect(adapterA, { handshakeTimeout: 10000 });
@@ -95,7 +64,7 @@ console.log("A 配对成功", credentialA);
 await channelA.send("Secure message");
 ```
 
-### 3. 使用凭证重连
+### 使用凭证重连
 
 ```typescript
 // A 有 B 的 Credential（之前配对获得的）

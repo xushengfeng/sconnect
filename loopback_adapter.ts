@@ -7,6 +7,58 @@ type MessageHandler = (data: Uint8Array) => void;
 type CloseHandler = () => void;
 type ErrorHandler = (err: Error) => void;
 
+export class LoopbackAdapterManager {
+	private m = new Map<string, LoopbackAdapter>();
+	newAdapter() {
+		return new LoopbackAdapter(this);
+	}
+	setId(id: string, adapter: LoopbackAdapter) {
+		this.m.set(id, adapter);
+	}
+	connect(id1: string, id2: string) {
+		const a = this.m.get(id1);
+		const b = this.m.get(id2);
+		if (!a || !b) {
+			throw new Error("Adapter not found");
+		}
+		a.peer = b;
+		b.peer = a;
+	}
+	static createPair(): [LoopbackAdapter, LoopbackAdapter] {
+		const manager = new LoopbackAdapterManager();
+		const a = new LoopbackAdapter(manager);
+		const b = new LoopbackAdapter(manager);
+		return [a, b];
+	}
+}
+
+export class UntrustedLoopbackAdapterManager {
+	private m = new Map<string, UntrustedLoopbackAdapter>();
+	newAdapter(supportNativeEncryption = true) {
+		return new UntrustedLoopbackAdapter(this, supportNativeEncryption);
+	}
+	setId(id: string, adapter: UntrustedLoopbackAdapter) {
+		this.m.set(id, adapter);
+	}
+	connect(id1: string, id2: string) {
+		const a = this.m.get(id1);
+		const b = this.m.get(id2);
+		if (!a || !b) {
+			throw new Error("Adapter not found");
+		}
+		a.peer = b;
+		b.peer = a;
+	}
+	static createPair(
+		supportNativeEncryption = true,
+	): [UntrustedLoopbackAdapter, UntrustedLoopbackAdapter] {
+		const manager = new UntrustedLoopbackAdapterManager();
+		const a = new UntrustedLoopbackAdapter(manager, supportNativeEncryption);
+		const b = new UntrustedLoopbackAdapter(manager, supportNativeEncryption);
+		return [a, b];
+	}
+}
+
 /**
  * 受信任的本地回环信令适配器，用于测试。
  * 外部已验证身份，不加密。
@@ -15,21 +67,24 @@ export class LoopbackAdapter implements TrustedSignalingAdapter {
 	trustIdentity = true as const;
 	supportNativeEncryption = false as const;
 
-	private peer: LoopbackAdapter | null = null;
+	peer: LoopbackAdapter | null = null;
+	private id: string | null = null;
 	private messageHandler: MessageHandler | null = null;
 	private closeHandler: CloseHandler | null = null;
 
-	static createPair(): [LoopbackAdapter, LoopbackAdapter] {
-		const a = new LoopbackAdapter();
-		const b = new LoopbackAdapter();
-		a.peer = b;
-		b.peer = a;
-		return [a, b];
+	constructor(private manager: LoopbackAdapterManager) {}
+
+	async init(_myId: string): Promise<void> {
+		this.id = _myId;
+		this.manager.setId(_myId, this);
 	}
 
-	async init(_myId: string): Promise<void> {}
-
-	async connect(_id: string): Promise<void> {}
+	async connect(_id: string): Promise<void> {
+		if (!this.id) {
+			throw new Error("Adapter not initialized");
+		}
+		this.manager.connect(this.id, _id);
+	}
 
 	async send(data: Uint8Array): Promise<void> {
 		if (!this.peer) {
@@ -67,27 +122,29 @@ export class UntrustedLoopbackAdapter implements UntrustedSignalingAdapter {
 	trustIdentity = false as const;
 	supportNativeEncryption: boolean;
 
-	private peer: UntrustedLoopbackAdapter | null = null;
+	id: string | null = null;
+	peer: UntrustedLoopbackAdapter | null = null;
 	private messageHandler: MessageHandler | null = null;
 	private closeHandler: CloseHandler | null = null;
 
-	constructor(supportNativeEncryption = true) {
+	constructor(
+		private manager: UntrustedLoopbackAdapterManager,
+		supportNativeEncryption = true,
+	) {
 		this.supportNativeEncryption = supportNativeEncryption;
 	}
 
-	static createPair(
-		supportNativeEncryption = true,
-	): [UntrustedLoopbackAdapter, UntrustedLoopbackAdapter] {
-		const a = new UntrustedLoopbackAdapter(supportNativeEncryption);
-		const b = new UntrustedLoopbackAdapter(supportNativeEncryption);
-		a.peer = b;
-		b.peer = a;
-		return [a, b];
+	async init(_myId: string): Promise<void> {
+		this.id = _myId;
+		this.manager.setId(_myId, this);
 	}
 
-	async init(_myId: string): Promise<void> {}
-
-	async connect(_id: string): Promise<void> {}
+	async connect(_id: string): Promise<void> {
+		if (!this.id) {
+			throw new Error("Adapter not initialized");
+		}
+		this.manager.connect(this.id, _id);
+	}
 
 	async send(data: Uint8Array): Promise<void> {
 		if (!this.peer) {

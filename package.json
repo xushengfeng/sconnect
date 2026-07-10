@@ -18,7 +18,7 @@
             "types": "./dist/peerjs_adapter.d.ts",
             "import": "./dist/peerjs_adapter.js"
         },
-        "./loopback_adapter": {
+        "./loopback_adapter_manager": {
             "types": "./dist/loopback_adapter.d.ts",
             "import": "./dist/loopback_adapter.js"
         },

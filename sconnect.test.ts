@@ -10,7 +10,10 @@ import {
 	sigh,
 	verifySignature,
 } from "./sconnect";
-import { LoopbackAdapter, UntrustedLoopbackAdapter } from "./loopback_adapter";
+import {
+	LoopbackAdapterManager,
+	UntrustedLoopbackAdapterManager,
+} from "./loopback_adapter";
 import type { ConnectRequest, PairRequest } from "./sconnect_type";
 
 function waitForEvent<T extends any[], E extends string>(
@@ -33,7 +36,7 @@ function waitForEvent<T extends any[], E extends string>(
 describe("SConnect", () => {
 	describe("受信任信道 (trustIdentity=true)", () => {
 		it("应直接建立明文连接", async () => {
-			const [adapterA, adapterB] = LoopbackAdapter.createPair();
+			const [adapterA, adapterB] = LoopbackAdapterManager.createPair();
 			const channelA = new SConnect(adapterA);
 			const channelB = new SConnect(adapterB);
 
@@ -53,7 +56,7 @@ describe("SConnect", () => {
 		});
 
 		it("消息应为明文（不加密）", async () => {
-			const [adapterA, adapterB] = LoopbackAdapter.createPair();
+			const [adapterA, adapterB] = LoopbackAdapterManager.createPair();
 			const channelA = new SConnect(adapterA);
 			const channelB = new SConnect(adapterB);
 
@@ -88,7 +91,8 @@ describe("SConnect", () => {
 
 	describe("不受信任信道 - PAKE 配对 (trustIdentity=false)", () => {
 		it("无凭证时应返回 NEEDS_PAIRING", async () => {
-			const [adapterA, adapterB] = UntrustedLoopbackAdapter.createPair();
+			const [adapterA, adapterB] = UntrustedLoopbackAdapterManager.createPair();
+			adapterB.init("device-b");
 			const channelA = new SConnect(adapterA);
 
 			await channelA.init("device-a", "device-b");
@@ -105,7 +109,7 @@ describe("SConnect", () => {
 		});
 
 		it("发起方 pairInit 应触发接收方 pairRequest 事件", async () => {
-			const [adapterA, adapterB] = UntrustedLoopbackAdapter.createPair();
+			const [adapterA, adapterB] = UntrustedLoopbackAdapterManager.createPair();
 			const channelA = new SConnect(adapterA, { handshakeTimeout: 10000 });
 			const channelB = new SConnect(adapterB, { handshakeTimeout: 10000 });
 
@@ -137,7 +141,7 @@ describe("SConnect", () => {
 		});
 
 		it("完整配对流程：A 发起，B 输入 PIN", async () => {
-			const [adapterA, adapterB] = UntrustedLoopbackAdapter.createPair();
+			const [adapterA, adapterB] = UntrustedLoopbackAdapterManager.createPair();
 			const channelA = new SConnect(adapterA, { handshakeTimeout: 10000 });
 			const channelB = new SConnect(adapterB, { handshakeTimeout: 10000 });
 
@@ -191,7 +195,7 @@ describe("SConnect", () => {
 		});
 
 		it("完整配对流程2：A 发起，A 输入 PIN", async () => {
-			const [adapterA, adapterB] = UntrustedLoopbackAdapter.createPair();
+			const [adapterA, adapterB] = UntrustedLoopbackAdapterManager.createPair();
 			const channelA = new SConnect(adapterA, { handshakeTimeout: 10000 });
 			const channelB = new SConnect(adapterB, { handshakeTimeout: 10000 });
 
@@ -249,7 +253,7 @@ describe("SConnect", () => {
 		});
 
 		it("B 可以拒绝配对请求", async () => {
-			const [adapterA, adapterB] = UntrustedLoopbackAdapter.createPair();
+			const [adapterA, adapterB] = UntrustedLoopbackAdapterManager.createPair();
 			const channelA = new SConnect(adapterA, { pairingTimeout: 2000 });
 			const channelB = new SConnect(adapterB, { pairingTimeout: 2000 });
 
@@ -283,7 +287,8 @@ describe("SConnect", () => {
 		});
 
 		it("PAKE 配对后消息应被加密 (supportNativeEncryption=false)", async () => {
-			const [adapterA, adapterB] = UntrustedLoopbackAdapter.createPair(false);
+			const [adapterA, adapterB] =
+				UntrustedLoopbackAdapterManager.createPair(false);
 			const channelA = new SConnect(adapterA, { handshakeTimeout: 10000 });
 			const channelB = new SConnect(adapterB, { handshakeTimeout: 10000 });
 
@@ -329,7 +334,8 @@ describe("SConnect", () => {
 		});
 
 		it("supportNativeEncryption=true 时不加密", async () => {
-			const [adapterA, adapterB] = UntrustedLoopbackAdapter.createPair(true);
+			const [adapterA, adapterB] =
+				UntrustedLoopbackAdapterManager.createPair(true);
 			const channelA = new SConnect(adapterA, { handshakeTimeout: 10000 });
 			const channelB = new SConnect(adapterB, { handshakeTimeout: 10000 });
 
@@ -387,7 +393,8 @@ describe("SConnect", () => {
 			const keyPairB = await generateSigningKeyPair();
 
 			// 第二次重连
-			const [adapterA2, adapterB2] = UntrustedLoopbackAdapter.createPair();
+			const [adapterA2, adapterB2] =
+				UntrustedLoopbackAdapterManager.createPair();
 			const channelA2 = new SConnect(adapterA2, { handshakeTimeout: 10000 });
 			const channelB2 = new SConnect(adapterB2, { handshakeTimeout: 10000 });
 
@@ -424,7 +431,8 @@ describe("SConnect", () => {
 			const keyPairB = await generateSigningKeyPair();
 
 			// 第二次重连
-			const [adapterA2, adapterB2] = UntrustedLoopbackAdapter.createPair();
+			const [adapterA2, adapterB2] =
+				UntrustedLoopbackAdapterManager.createPair();
 			const channelA2 = new SConnect(adapterA2, { handshakeTimeout: 10000 });
 			const channelB2 = new SConnect(adapterB2, { handshakeTimeout: 10000 });
 
@@ -478,7 +486,8 @@ describe("SConnect", () => {
 			const keyPairB = await generateSigningKeyPair();
 
 			// 第二次重连 - B 拒绝
-			const [adapterA2, adapterB2] = UntrustedLoopbackAdapter.createPair();
+			const [adapterA2, adapterB2] =
+				UntrustedLoopbackAdapterManager.createPair();
 			const channelA2 = new SConnect(adapterA2, { handshakeTimeout: 2000 });
 			const channelB2 = new SConnect(adapterB2, { handshakeTimeout: 2000 });
 
@@ -520,7 +529,8 @@ describe("SConnect", () => {
 			const keyPairB = await generateSigningKeyPair();
 
 			// 第二次重连 - B 自动拒绝
-			const [adapterA2, adapterB2] = UntrustedLoopbackAdapter.createPair();
+			const [adapterA2, adapterB2] =
+				UntrustedLoopbackAdapterManager.createPair();
 			const channelA2 = new SConnect(adapterA2, { handshakeTimeout: 2000 });
 			const channelB2 = new SConnect(adapterB2, { handshakeTimeout: 2000 });
 
@@ -549,7 +559,8 @@ describe("SConnect", () => {
 			const keyPairB = await generateSigningKeyPair();
 
 			// 第二次重连
-			const [adapterA2, adapterB2] = UntrustedLoopbackAdapter.createPair();
+			const [adapterA2, adapterB2] =
+				UntrustedLoopbackAdapterManager.createPair();
 			const channelA2 = new SConnect(adapterA2, { handshakeTimeout: 10000 });
 			const channelB2 = new SConnect(adapterB2, { handshakeTimeout: 10000 });
 
@@ -600,7 +611,7 @@ describe("SConnect", () => {
 
 	describe("事件系统", () => {
 		it("应触发 ready 和 disconnect 事件", async () => {
-			const [adapterA, adapterB] = LoopbackAdapter.createPair();
+			const [adapterA, adapterB] = LoopbackAdapterManager.createPair();
 			const channelA = new SConnect(adapterA);
 			const channelB = new SConnect(adapterB);
 
@@ -625,7 +636,7 @@ describe("SConnect", () => {
 
 	describe("二进制数据传输", () => {
 		it("应支持发送和接收二进制数据", async () => {
-			const [adapterA, adapterB] = LoopbackAdapter.createPair();
+			const [adapterA, adapterB] = LoopbackAdapterManager.createPair();
 			const channelA = new SConnect(adapterA);
 			const channelB = new SConnect(adapterB);
 
@@ -651,7 +662,7 @@ describe("SConnect", () => {
 
 	describe("频率限制", () => {
 		it("应限制配对请求频率", async () => {
-			const [adapterA, adapterB] = UntrustedLoopbackAdapter.createPair();
+			const [adapterA, adapterB] = UntrustedLoopbackAdapterManager.createPair();
 			const channelA = new SConnect(adapterA, { pairInterval: 1000 });
 			const channelB = new SConnect(adapterB, { pairInterval: 1000 });
 
@@ -691,7 +702,8 @@ describe("SConnect", () => {
 		});
 
 		it("应限制连接请求频率", async () => {
-			const [adapterA1, adapterB1] = UntrustedLoopbackAdapter.createPair();
+			const [adapterA1, adapterB1] =
+				UntrustedLoopbackAdapterManager.createPair();
 			const channelA1 = new SConnect(adapterA1, { handshakeTimeout: 10000 });
 			const channelB1 = new SConnect(adapterB1, { handshakeTimeout: 10000 });
 
@@ -724,7 +736,8 @@ describe("SConnect", () => {
 			channelA1.disconnect();
 			channelB1.disconnect();
 
-			const [adapterA2, adapterB2] = UntrustedLoopbackAdapter.createPair();
+			const [adapterA2, adapterB2] =
+				UntrustedLoopbackAdapterManager.createPair();
 			const channelA = new SConnect(adapterA2, { connectInterval: 100 });
 			const channelB = new SConnect(adapterB2, { connectInterval: 100 });
 
