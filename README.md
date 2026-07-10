@@ -1,14 +1,14 @@
 # myde-remote-connect
 
-安全远程连接模块，支持 PAKE 配对和 Noise IK 握手。
+远程连接模块，支持配对和自动连接。
 
 ## 功能特性
 
-- **端到端加密**: 使用 Noise IK 协议建立安全通道
-- **PAKE 配对**: 基于 SPAKE2 协议的 PIN 码配对
-- **凭证管理**: 支持凭证保存和重连
-- **多种适配器**: 支持 PeerJS (WebRTC)、本地回环等
-- **浏览器兼容**: 纯 ESM 模块，无 Node.js 依赖
+- 端到端加密
+- 通过 PIN 码配对
+- 支持凭证保存和重连
+- 多种适配器: 支持 PeerJS (WebRTC)、本地回环等
+- 纯 ESM 模块（浏览器、nodejs、electron兼容）
 
 ## 快速开始
 
