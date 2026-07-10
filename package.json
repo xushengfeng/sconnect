@@ -36,14 +36,6 @@
         "build:types": "tsc --emitDeclarationOnly --declaration --outDir dist",
         "test": "vitest run"
     },
-    "peerDependencies": {
-        "peerjs": "^1.5.5"
-    },
-    "peerDependenciesMeta": {
-        "peerjs": {
-            "optional": true
-        }
-    },
     "license": "AGPL-3.0-only",
     "repository": {
         "type": "git",
@@ -54,5 +46,8 @@
         "typescript": "^6.0.3",
         "vite": "^8.1.3",
         "vitest": "^4.1.9"
+    },
+    "dependencies": {
+        "peerjs": "^1.5.5"
     }
 }
