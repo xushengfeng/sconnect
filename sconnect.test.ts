@@ -43,13 +43,38 @@ describe("SConnect", () => {
 			await channelA.init("device-a", "device-b");
 			await channelB.init("device-b", "device-a");
 
-			const [resultA, resultB] = await Promise.all([
-				channelA.tryConnect(),
-				channelB.tryConnect(),
-			]);
+			const result = channelA.tryConnect();
+			const reqPromise = Promise.withResolvers();
+			channelB.on("connectRequest", (req) => {
+				req.accept();
+				reqPromise.resolve(0);
+			});
+
+			const [resultA] = await Promise.all([result, reqPromise.promise]);
 
 			expect(resultA.success).toBe(true);
-			expect(resultB.success).toBe(true);
+
+			channelA.disconnect();
+			channelB.disconnect();
+		});
+		it("可以拒绝", async () => {
+			const [adapterA, adapterB] = LoopbackAdapterManager.createPair();
+			const channelA = new SConnect(adapterA);
+			const channelB = new SConnect(adapterB);
+
+			await channelA.init("device-a", "device-b");
+			await channelB.init("device-b", "device-a");
+
+			const result = channelA.tryConnect();
+			const reqPromise = Promise.withResolvers();
+			channelB.on("connectRequest", (req) => {
+				req.reject();
+				reqPromise.resolve(0);
+			});
+
+			const [resultA] = await Promise.all([result, reqPromise.promise]);
+
+			expect(resultA.success).toBe(false);
 
 			channelA.disconnect();
 			channelB.disconnect();
@@ -73,7 +98,13 @@ describe("SConnect", () => {
 			const receivedMessages: string[] = [];
 			channelB.on("data", (_, text) => receivedMessages.push(text()));
 
-			await Promise.all([channelA.tryConnect(), channelB.tryConnect()]);
+			const result = channelA.tryConnect();
+			const reqPromise = Promise.withResolvers();
+			channelB.on("connectRequest", (req) => {
+				req.accept();
+				reqPromise.resolve(0);
+			});
+			await Promise.all([result, reqPromise.promise]);
 
 			const testMessage = "plaintext hello";
 			await channelA.send(testMessage);
@@ -458,7 +489,7 @@ describe("SConnect", () => {
 			const connectRequest = await connectRequestPromise;
 
 			// B 接受连接
-			const resultBPromise = connectRequest.accept({
+			const resultBPromise = connectRequest.acceptWithCre({
 				createdAt: Date.now(),
 				myPrivateKey: keyPairB.privateKey,
 				myPublicKey: keyPairB.publicKey,
@@ -587,7 +618,7 @@ describe("SConnect", () => {
 
 			// B 接受连接
 			const connectRequest = await connectRequestPromise;
-			const resultBPromise = connectRequest.accept({
+			const resultBPromise = connectRequest.acceptWithCre({
 				createdAt: Date.now(),
 				myPrivateKey: keyPairB.privateKey,
 				myPublicKey: keyPairB.publicKey,
@@ -621,7 +652,13 @@ describe("SConnect", () => {
 			// @ts-ignore
 			const readyPromise = waitForEvent(channelA, "ready");
 
-			await Promise.all([channelA.tryConnect(), channelB.tryConnect()]);
+			const result = channelA.tryConnect();
+			const reqPromise = Promise.withResolvers();
+			channelB.on("connectRequest", (req) => {
+				req.accept();
+				reqPromise.resolve(0);
+			});
+			await Promise.all([result, reqPromise.promise]);
 
 			await readyPromise;
 
@@ -646,7 +683,13 @@ describe("SConnect", () => {
 			const receivedData: ArrayBuffer[] = [];
 			channelB.on("data", (data) => receivedData.push(data));
 
-			await Promise.all([channelA.tryConnect(), channelB.tryConnect()]);
+			const result = channelA.tryConnect();
+			const reqPromise = Promise.withResolvers();
+			channelB.on("connectRequest", (req) => {
+				req.accept();
+				reqPromise.resolve(0);
+			});
+			await Promise.all([result, reqPromise.promise]);
 
 			const testData = new Uint8Array([1, 2, 3, 4, 5]);
 			await channelA.sendBinary(testData);

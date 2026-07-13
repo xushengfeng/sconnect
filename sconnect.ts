@@ -168,9 +168,23 @@ export class SConnect implements SecureChannel {
 			await this.signalAdapter.connect(this.remoteId);
 
 			if (this.signalAdapter.trustIdentity) {
-				this.setState("Connected");
-				this.emit("ready");
-				return { success: true, credential: this.buildCredential(credential) };
+				this.setState("Handshaking", "connect-request");
+				await this.sendTypeMessage(
+					MSG_CONNECT_REQUEST,
+					new TextEncoder().encode(this.myDeviceId),
+				);
+				const r = (await this.getTypeMessage(MSG_CONNECT_ACCEPT))[0];
+				if (r === 1) {
+					this.setState("Connected");
+					this.emit("ready");
+					return {
+						success: true,
+						credential: this.buildCredential(credential),
+					};
+				} else {
+					this.setState("Ready");
+					return { success: false };
+				}
 			}
 
 			if (
@@ -275,7 +289,23 @@ export class SConnect implements SecureChannel {
 
 		const request: ConnectRequest = {
 			remoteDeviceId: senderId,
-			accept: (credential: Credential): Promise<ConnectResult> => {
+			accept: (credential?: Credential) => {
+				if (this.signalAdapter.trustIdentity) {
+					this.setState("Connected");
+					this.emit("ready");
+					this.sendTypeMessage(MSG_CONNECT_ACCEPT, new Uint8Array([1])).catch(
+						() => {},
+					);
+				} else {
+					if (!credential) {
+						throw new SConnectError(
+							"CREDENTIAL_INVALID",
+							"Credential is required",
+						);
+					}
+				}
+			},
+			acceptWithCre: (credential: Credential): Promise<ConnectResult> => {
 				this.setState("Handshaking", "connect-response");
 				this.sendTypeMessage(MSG_CONNECT_ACCEPT, new Uint8Array([1])).catch(
 					() => {},
@@ -708,7 +738,12 @@ export class SConnect implements SecureChannel {
 		});
 		const timer = setTimeout(() => {
 			this.typeMessageResolvers.delete(type);
-			p.reject(new SConnectError("TIMEOUT", `Timeout waiting for message type ${type}`));
+			p.reject(
+				new SConnectError(
+					"TIMEOUT",
+					`Timeout waiting for message type ${type}`,
+				),
+			);
 		}, this.options.handshakeTimeout);
 		this.activeTimers.add(timer);
 		return p.promise;
@@ -721,7 +756,7 @@ export class SConnect implements SecureChannel {
 			myDeviceId: this.myDeviceId,
 			remoteDeviceId: this.remoteId,
 			myPrivateKey: new Uint8Array(),
-			myPublicKey:  new Uint8Array(),
+			myPublicKey: new Uint8Array(),
 			remotePublicKey: new Uint8Array(),
 			createdAt: Date.now(),
 			lastConnected: Date.now(),
