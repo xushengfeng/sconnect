@@ -305,7 +305,9 @@ export class SConnect implements SecureChannel {
 					}
 				}
 			},
-			acceptWithCre: (credential: Credential): Promise<ConnectResult> => {
+			acceptWithCre: (
+				credential: CredentialPrivateInfo,
+			): Promise<ConnectResult> => {
 				this.setState("Handshaking", "connect-response");
 				this.sendTypeMessage(MSG_CONNECT_ACCEPT, new Uint8Array([1])).catch(
 					() => {},

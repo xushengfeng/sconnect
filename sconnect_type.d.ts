@@ -159,7 +159,7 @@ interface ConnectRequest {
 	/** 发起方的显示名称（可选） */
 	/** 接受连接请求，传入本地保存的关于对方的 Credential */
 	accept: () => void;
-	acceptWithCre: (credential) => Promise<ConnectResult>;
+	acceptWithCre: (credential: CredentialPrivateInfo) => Promise<ConnectResult>;
 	/** 拒绝连接请求 */
 	reject: () => void;
 }
