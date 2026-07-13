@@ -1,6 +1,6 @@
 {
     "name": "myde-remote-connect",
-    "version": "0.0.4",
+    "version": "0.0.5",
     "description": "Secure remote connection module with PAKE pairing and Noise IK handshake",
     "type": "module",
     "main": "./dist/sconnect.js",
