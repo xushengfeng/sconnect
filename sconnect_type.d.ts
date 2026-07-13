@@ -144,8 +144,6 @@ interface UntrustedSignalingAdapter {
 interface PairRequest {
 	/** 发起方的设备 ID */
 	remoteDeviceId: string;
-	/** 发起方的显示名称（可选） */
-	remoteDisplayName?: string;
 	/** 输入对方的 PIN（触发 PAKE 交换） */
 	inputOtherPin: (pin: string) => void;
 	/** 等待配对完成 */
@@ -159,7 +157,6 @@ interface ConnectRequest {
 	/** 发起方的设备 ID */
 	remoteDeviceId: string;
 	/** 发起方的显示名称（可选） */
-	remoteDisplayName?: string;
 	/** 接受连接请求，传入本地保存的关于对方的 Credential */
 	accept: () => void;
 	acceptWithCre: (credential) => Promise<ConnectResult>;
@@ -186,12 +183,8 @@ interface ChannelOptions {
 interface CredentialPublicInfo {
 	/** 我方设备 UUID */
 	myDeviceId: string;
-	/** 我方可读名称（可选） */
-	myDisplayName?: string;
 	/** 对方设备 UUID */
 	remoteDeviceId: string;
-	/** 对方可读名称（可选） */
-	remoteDisplayName?: string;
 }
 
 interface CredentialPrivateInfo {
