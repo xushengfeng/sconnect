@@ -1,11 +1,10 @@
 import { describe, it, expect } from "vitest";
 import {
-	blind,
 	cipher,
-	deBlind,
 	dh,
 	generateKeyPair,
 	generateSigningKeyPair,
+	hashToCurvePoint,
 	SConnect,
 	sigh,
 	verifySignature,
@@ -326,39 +325,44 @@ describe("SConnect", () => {
 			await channelA.init("device-a");
 			await channelB.init("device-b");
 
-			let rawSentData: Uint8Array | null = null;
-			const originalSend = adapterA.send.bind(adapterA);
-			adapterA.send = async (data: Uint8Array) => {
-				rawSentData = new Uint8Array(data);
-				return originalSend(data);
-			};
+		let rawSentData: Uint8Array | null = null;
+		const originalSend = adapterA.send.bind(adapterA);
+		adapterA.send = async (data: Uint8Array) => {
+			rawSentData = new Uint8Array(data);
+			return originalSend(data);
+		};
 
-			// B 监听配对请求
-			const pairRequestPromise = new Promise<PairRequest>((resolve) => {
-				channelB.on("pairRequest", (request) => {
-					resolve(request);
-				});
+		const receivedMessages: string[] = [];
+		channelB.on("data", (_, text) => receivedMessages.push(text()));
+
+		// B 监听配对请求
+		const pairRequestPromise = new Promise<PairRequest>((resolve) => {
+			channelB.on("pairRequest", (request) => {
+				resolve(request);
 			});
+		});
 
-			// A 发起配对
-			const pairingA = await channelA.pairInit({
-				myDeviceId: "device-a",
-				remoteDeviceId: "device-b",
-			});
+		// A 发起配对
+		const pairingA = await channelA.pairInit({
+			myDeviceId: "device-a",
+			remoteDeviceId: "device-b",
+		});
 
-			const pairRequest = await pairRequestPromise;
-			pairRequest.inputOtherPin(pairingA.pin);
-			const credentialBPromise = pairRequest.waitForPairing();
-			const credentialAPromise = pairingA.waitForPairing();
+		const pairRequest = await pairRequestPromise;
+		pairRequest.inputOtherPin(pairingA.pin);
+		const credentialBPromise = pairRequest.waitForPairing();
+		const credentialAPromise = pairingA.waitForPairing();
 
-			await Promise.all([credentialAPromise, credentialBPromise]);
+		await Promise.all([credentialAPromise, credentialBPromise]);
 
-			const testMessage = "should be encrypted";
-			await channelA.send(testMessage);
-			await new Promise((r) => setTimeout(r, 100));
+		const testMessage = "should be encrypted";
+		await channelA.send(testMessage);
+		await new Promise((r) => setTimeout(r, 100));
 
-			expect(rawSentData).not.toBeNull();
-			expect(new TextDecoder().decode(rawSentData!)).not.toBe(testMessage);
+		expect(rawSentData).not.toBeNull();
+		expect(new TextDecoder().decode(rawSentData!)).not.toBe(testMessage);
+		// 双向密钥一致，B 必须能真正解密
+		expect(receivedMessages).toContain(testMessage);
 
 			channelA.disconnect();
 			channelB.disconnect();
@@ -589,9 +593,9 @@ describe("SConnect", () => {
 			const keyPairA = await generateSigningKeyPair();
 			const keyPairB = await generateSigningKeyPair();
 
-			// 第二次重连
+			// 第二次重连（关闭原生加密，强制走库内 cipher 验证双向密钥一致）
 			const [adapterA2, adapterB2] =
-				UntrustedLoopbackAdapterManager.createPair();
+				UntrustedLoopbackAdapterManager.createPair(false);
 			const channelA2 = new SConnect(adapterA2, { handshakeTimeout: 10000 });
 			const channelB2 = new SConnect(adapterB2, { handshakeTimeout: 10000 });
 
@@ -820,12 +824,31 @@ describe("密码学验证", () => {
 			await dh(keyPairB.privateKey, keyPairA.publicKey),
 		);
 	});
-	it("盲签名", async () => {
-		const keyPair = await generateKeyPair();
-		const pin = "1234";
-		const blinded = blind(pin, keyPair.publicKey);
-		const deblinded = deBlind(blinded, pin);
-		expect(deblinded).toEqual(keyPair.publicKey);
+	it("SPEKE 盲化交换对称", async () => {
+		const keyPairA = await generateKeyPair();
+		const keyPairB = await generateKeyPair();
+		const pin = "123456";
+		const pinPoint = await hashToCurvePoint(pin);
+		const blindedA = await dh(keyPairA.privateKey, pinPoint);
+		const blindedB = await dh(keyPairB.privateKey, pinPoint);
+		expect(await dh(keyPairA.privateKey, blindedB)).toEqual(
+			await dh(keyPairB.privateKey, blindedA),
+		);
+	});
+	it("不同 PIN 无法得到相同共享密钥", async () => {
+		const keyPairA = await generateKeyPair();
+		const keyPairB = await generateKeyPair();
+		const blindedA = await dh(
+			keyPairA.privateKey,
+			await hashToCurvePoint("111111"),
+		);
+		const blindedB = await dh(
+			keyPairB.privateKey,
+			await hashToCurvePoint("222222"),
+		);
+		expect(await dh(keyPairA.privateKey, blindedB)).not.toEqual(
+			await dh(keyPairB.privateKey, blindedA),
+		);
 	});
 	it("签名验证", async () => {
 		const keyPair = await generateSigningKeyPair();

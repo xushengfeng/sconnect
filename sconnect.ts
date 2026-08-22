@@ -231,38 +231,36 @@ export class SConnect implements SecureChannel {
 
 		const dhSecret = await dh(eph.privateKey, otherPubKey);
 
-		const info = buildConnectionInfo(
+		// 规范化 transcript + 双向独立密钥，两侧派生出一致的收发密钥
+		const transcript = buildConnectionTranscript(
 			this.myDeviceId,
 			this.remoteId,
 			eph.publicKey,
 			otherPubKey,
 		);
-		const derivedKey = await derive(dhSecret, info, new Uint8Array(0));
-		const myMac = await mac(derivedKey, info);
-		await this.sendTypeMessage(MSG_CONNECT_MAC_VER, myMac);
-		const otherMac = await this.getTypeMessage(MSG_CONNECT_MAC_VER);
-
-		const otherInfo = buildConnectionInfo(
-			this.remoteId,
-			this.myDeviceId,
-			otherPubKey,
-			eph.publicKey,
-		);
-		const otherDerivedKey = await derive(
+		const material = await derive(
 			dhSecret,
-			otherInfo,
+			transcript,
 			new Uint8Array(0),
+			512,
 		);
-		const otherMacCheck = await mac(otherDerivedKey, otherInfo);
+		const k1 = material.subarray(0, 32);
+		const k2 = material.subarray(32, 64);
 
-		const macValid = verify(otherMac, otherMacCheck);
-		if (!macValid) {
+		const confirmMac = await mac(k1, transcript);
+		await this.sendTypeMessage(MSG_CONNECT_MAC_VER, confirmMac);
+		const otherMac = await this.getTypeMessage(MSG_CONNECT_MAC_VER);
+		if (!verify(otherMac, confirmMac)) {
 			this.setState("Ready");
 			return { success: false, reason: "NEEDS_PAIRING" };
 		}
 
 		if (!this.signalAdapter.supportNativeEncryption) {
-			this.cipher = new cipher(derivedKey, derivedKey);
+			const iAmLow = compareBytes(eph.publicKey, otherPubKey) < 0;
+			this.cipher = new cipher(
+				iAmLow ? k1 : k2,
+				iAmLow ? k2 : k1,
+			);
 		}
 		this.setState("Connected");
 		this.emit("ready");
@@ -407,49 +405,39 @@ export class SConnect implements SecureChannel {
 				return op.PIN;
 			})(),
 		]);
-		const bindPublicKey = blind(finalPin, keyPair.publicKey);
-		await this.sendTypeMessage(MSG_BLIND_PUBLIC_KEY, bindPublicKey);
-		const otherBindPublicKey = await this.getTypeMessage(MSG_BLIND_PUBLIC_KEY);
-		if (otherBindPublicKey === undefined) {
+
+		// SPEKE 风格 PAKE：双方各自与 PIN 派生的"生成元"做 DH，
+		// 线上只出现被随机私钥盲化后的值，窃听者无法离线验证 PIN 猜测
+		const pinPoint = await hashToCurvePoint(finalPin);
+		const myBlinded = await dh(keyPair.privateKey, pinPoint);
+		await this.sendTypeMessage(MSG_BLIND_PUBLIC_KEY, myBlinded);
+		const otherBlinded = await this.getTypeMessage(MSG_BLIND_PUBLIC_KEY);
+		if (!otherBlinded) {
 			throw new SConnectError(
 				"PAIRING_FAILED",
 				"Failed to receive blinded public key from peer",
 			);
 		}
-		const otherPublicKey = deBlind(otherBindPublicKey, finalPin);
-		const s = await dh(keyPair.privateKey, otherPublicKey);
+		const s = await dh(keyPair.privateKey, otherBlinded);
 
-		const info = buildPairingInfo(
+		// 双方按字典序规范化 transcript，保证派生出相同的密钥材料
+		const transcript = buildPairingTranscript(
 			finalPin,
 			this.myDeviceId,
 			op.remoteDeviceId,
-			keyPair.publicKey,
-			otherPublicKey,
+			myBlinded,
+			otherBlinded,
 		);
-		const derivedKey = await derive(
-			s,
-			info,
-			new TextEncoder().encode(finalPin),
-		);
-		const myMac = await mac(derivedKey, info);
-		await this.sendTypeMessage(MSG_SPAKE_DATA, myMac);
+		const pinBytes = new TextEncoder().encode(finalPin);
+		const material = await derive(s, transcript, pinBytes, 512);
+		const k1 = material.subarray(0, 32);
+		const k2 = material.subarray(32, 64);
+
+		// 密钥确认：PIN 不一致时双方密钥不同，MAC 校验必然失败
+		const confirmMac = await mac(k1, transcript);
+		await this.sendTypeMessage(MSG_SPAKE_DATA, confirmMac);
 		const otherMac = await this.getTypeMessage(MSG_SPAKE_DATA);
-
-		const otherInfo = buildPairingInfo(
-			finalPin,
-			op.remoteDeviceId,
-			this.myDeviceId,
-			otherPublicKey,
-			keyPair.publicKey,
-		);
-		const otherDerivedKey = await derive(
-			s,
-			otherInfo,
-			new TextEncoder().encode(finalPin),
-		);
-		const otherMacCheck = await mac(otherDerivedKey, otherInfo);
-
-		if (!verify(otherMac, otherMacCheck)) {
+		if (!verify(otherMac, confirmMac)) {
 			throw new SConnectError("PAIRING_FAILED", "Pairing verification failed");
 		}
 
@@ -471,10 +459,10 @@ export class SConnect implements SecureChannel {
 		}
 
 		if (!this.signalAdapter.supportNativeEncryption) {
-			// todo 派生
+			const iAmLow = compareBytes(myBlinded, otherBlinded) < 0;
 			this.cipher = new cipher(
-				await dh(keyPair.privateKey, otherPublicKey),
-				await dh(keyPair.privateKey, otherPublicKey),
+				iAmLow ? k1 : k2,
+				iAmLow ? k2 : k1,
 			);
 		}
 
@@ -949,35 +937,17 @@ export class cipher {
 	}
 }
 
-// todo 更安全做法
-export function blind(pin: string, publicKey: Uint8Array): Uint8Array {
-	// 将 PIN 转换为 Uint8Array
+// SPEKE：把 PIN 哈希成 32 字节，直接作为 X25519 公钥导入使用（生成元）。
+// 依赖 Web Crypto 的 X25519 接受任意 32 字节串作为公钥
+export async function hashToCurvePoint(pin: string): Promise<Uint8Array> {
+	const label = new TextEncoder().encode("SConnect-SPEKE-v1:");
 	const pinBytes = new TextEncoder().encode(pin);
-
-	// 创建一个新的 Uint8Array 来存储盲化后的公钥
-	const blindedKey = new Uint8Array(publicKey.length);
-
-	// 对每个字节进行盲化处理
-	for (let i = 0; i < publicKey.length; i++) {
-		blindedKey[i] = publicKey[i] ^ pinBytes[i % pinBytes.length];
-	}
-
-	return blindedKey;
-}
-
-export function deBlind(blindedKey: Uint8Array, pin: string): Uint8Array {
-	// 将 PIN 转换为 Uint8Array
-	const pinBytes = new TextEncoder().encode(pin);
-
-	// 创建一个新的 Uint8Array 来存储去盲化后的公钥
-	const originalKey = new Uint8Array(blindedKey.length);
-
-	// 对每个字节进行去盲化处理
-	for (let i = 0; i < blindedKey.length; i++) {
-		originalKey[i] = blindedKey[i] ^ pinBytes[i % pinBytes.length];
-	}
-
-	return originalKey;
+	const input = concatUint8Arrays([label, pinBytes]);
+	const digest = await crypto.subtle.digest(
+		"SHA-256",
+		input as unknown as BufferSource,
+	);
+	return new Uint8Array(digest);
 }
 
 export async function dh(
@@ -1028,35 +998,58 @@ function buildEd25519Pkcs8(rawPrivKey: Uint8Array): ArrayBuffer {
 	return buf.buffer;
 }
 
-function buildPairingInfo(
+function compareBytes(a: Uint8Array, b: Uint8Array): number {
+	for (let i = 0; i < Math.min(a.length, b.length); i++) {
+		if (a[i] !== b[i]) return a[i] - b[i];
+	}
+	return a.length - b.length;
+}
+
+// transcript 的字段按字典序排列，与消息收发顺序无关，
+// 保证两端对同一次握手计算出完全相同的输入
+function buildPairingTranscript(
 	pin: string,
-	localId: string,
-	remoteId: string,
-	localEphemeralPk: Uint8Array,
-	remoteEphemeralPk: Uint8Array,
+	id1: string,
+	id2: string,
+	blinded1: Uint8Array,
+	blinded2: Uint8Array,
 ): ArrayBuffer {
 	const enc = new TextEncoder();
-	const pinBytes = enc.encode(pin);
-	const localIdBytes = enc.encode(localId);
-	const remoteIdBytes = enc.encode(remoteId);
-
-	const buf = new Uint8Array(
-		[
-			pinBytes,
-			localIdBytes,
-			remoteIdBytes,
-			localEphemeralPk,
-			remoteEphemeralPk,
-		].flatMap((arr) => [...arr]),
+	const [idLow, idHigh] = [enc.encode(id1), enc.encode(id2)].sort((x, y) =>
+		compareBytes(x, y),
 	);
+	const [bLow, bHigh] = [blinded1, blinded2].sort((x, y) =>
+		compareBytes(x, y),
+	);
+	return concatUint8Arrays([
+		enc.encode(pin),
+		idLow,
+		idHigh,
+		bLow,
+		bHigh,
+	]).buffer as ArrayBuffer;
+}
 
-	return buf.buffer;
+function buildConnectionTranscript(
+	id1: string,
+	id2: string,
+	pub1: Uint8Array,
+	pub2: Uint8Array,
+): ArrayBuffer {
+	const enc = new TextEncoder();
+	const [idLow, idHigh] = [enc.encode(id1), enc.encode(id2)].sort((x, y) =>
+		compareBytes(x, y),
+	);
+	const [pLow, pHigh] = [pub1, pub2].sort((x, y) => compareBytes(x, y));
+	return concatUint8Arrays([idLow, idHigh, pLow, pHigh])
+		.buffer as ArrayBuffer;
 }
 
 async function derive(
 	ikm: Uint8Array,
 	info: ArrayBuffer,
 	salt: Uint8Array,
+	bits = 256,
 ): Promise<Uint8Array> {
 	const key = await crypto.subtle.importKey(
 		"raw",
@@ -1065,7 +1058,7 @@ async function derive(
 		false,
 		["deriveBits"],
 	);
-	const bits = await crypto.subtle.deriveBits(
+	const bitsBuf = await crypto.subtle.deriveBits(
 		{
 			name: "HKDF",
 			hash: "SHA-256",
@@ -1073,9 +1066,9 @@ async function derive(
 			info,
 		},
 		key,
-		256,
+		bits,
 	);
-	return new Uint8Array(bits);
+	return new Uint8Array(bitsBuf);
 }
 
 async function mac(key: Uint8Array, data: ArrayBuffer): Promise<Uint8Array> {
@@ -1147,21 +1140,4 @@ export async function verifySignature(
 		signature as unknown as BufferSource,
 		data as unknown as BufferSource,
 	);
-}
-
-function buildConnectionInfo(
-	localId: string,
-	remoteId: string,
-	localEphemeralPk: Uint8Array,
-	remoteEphemeralPk: Uint8Array,
-): ArrayBuffer {
-	const enc = new TextEncoder();
-	const localIdBytes = enc.encode(localId);
-	const remoteIdBytes = enc.encode(remoteId);
-	return concatUint8Arrays([
-		localIdBytes,
-		remoteIdBytes,
-		localEphemeralPk,
-		remoteEphemeralPk,
-	]).buffer as ArrayBuffer;
 }
