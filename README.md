@@ -97,6 +97,18 @@ channelB.on("connectRequest", async (request) => {
 });
 ```
 
+### 验证前交流（明文告示）
+
+配对/身份验证之前，可以交换明文的公告信息（如设备名、问候语）。注意：这些信息未加密、未认证，不可包含敏感内容，接收方也不应将其作为信任依据。
+
+```typescript
+// 建立适配器连接后（如 pairInit 之后）即可发送告示消息
+await channelA.sendPreInfo("hello, 我是 device-a");
+channelB.on("preInfo", (text) => {
+    console.log("收到告示:", text);
+});
+```
+
 ## 更多
 
 见[AGENTS.md](AGENTS.md)

@@ -30,6 +30,7 @@ const MSG_BLIND_PUBLIC_KEY = 12;
 const MSG_CONNECT_PUBLIC_KEY = 13;
 const MSG_CONNECT_MAC_VER = 14;
 const MSG_SIGNING_PUBLIC_KEY = 15;
+const MSG_PREINFO = 16; // 验证前的明文告示消息（未认证，仅供展示）
 
 // 错误类
 class SConnectError extends Error {
@@ -67,6 +68,8 @@ type ErrorCode =
 	| "UNEXPECTED_MESSAGE"
 	| "NOT_CONNECTED"
 	| "ALREADY_CONNECTED"
+	// 告示消息
+	| "PREINFO_TOO_LARGE"
 	// 致命错误
 	| "ADAPTER_INIT_FAILED"
 	| "CRYPTO_UNAVAILABLE";
@@ -113,6 +116,7 @@ export class SConnect implements SecureChannel {
 
 	private pairLimiter: Limiter;
 	private connectLimiter: Limiter;
+	private preInfoLimiter: Limiter;
 	private failedPinAttempts = 0;
 
 	private textDecoder = new TextDecoder();
@@ -126,10 +130,12 @@ export class SConnect implements SecureChannel {
 			maxPinAttempts: options?.maxPinAttempts ?? 5,
 			pairInterval: options?.pairInterval ?? 1000,
 			connectInterval: options?.connectInterval ?? 20,
+			preInfoInterval: options?.preInfoInterval ?? 200,
 		};
 
 		this.pairLimiter = new Limiter(this.options.pairInterval);
 		this.connectLimiter = new Limiter(this.options.connectInterval);
+		this.preInfoLimiter = new Limiter(this.options.preInfoInterval);
 
 		this.signalAdapter.onMessage((data) => this.handleRawMessage(data));
 		this.signalAdapter.onClose(() => this.handleDisconnect());
@@ -239,12 +245,7 @@ export class SConnect implements SecureChannel {
 			eph.publicKey,
 			otherPubKey,
 		);
-		const material = await derive(
-			dhSecret,
-			transcript,
-			new Uint8Array(0),
-			512,
-		);
+		const material = await derive(dhSecret, transcript, new Uint8Array(0), 512);
 		const k1 = material.subarray(0, 32);
 		const k2 = material.subarray(32, 64);
 
@@ -258,10 +259,7 @@ export class SConnect implements SecureChannel {
 
 		if (!this.signalAdapter.supportNativeEncryption) {
 			const iAmLow = compareBytes(eph.publicKey, otherPubKey) < 0;
-			this.cipher = new cipher(
-				iAmLow ? k1 : k2,
-				iAmLow ? k2 : k1,
-			);
+			this.cipher = new cipher(iAmLow ? k1 : k2, iAmLow ? k2 : k1);
 		}
 		this.setState("Connected");
 		this.emit("ready");
@@ -325,6 +323,29 @@ export class SConnect implements SecureChannel {
 
 	// ================= 配对 =================
 
+	/**
+	 * 在配对/身份验证之前发送明文告示消息。
+	 * 注意：此消息未加密、未认证，不可用于传递敏感信息或作为信任依据。
+	 */
+	async sendPreInfo(text: string): Promise<void> {
+		if (this.state !== "Ready" && this.state !== "Handshaking") {
+			throw new SConnectError(
+				"CHANNEL_NOT_READY",
+				`Cannot send preInfo in ${this.state} state`,
+			);
+		}
+
+		const data = new TextEncoder().encode(text);
+		if (data.length > 1024) {
+			throw new SConnectError(
+				"PREINFO_TOO_LARGE",
+				"preInfo message too long (max 1024 bytes)",
+			);
+		}
+
+		await this.sendTypeMessage(MSG_PREINFO, data);
+	}
+
 	updatePIN(): string {
 		this.PIN = this.generatePin();
 		return this.PIN;
@@ -370,10 +391,7 @@ export class SConnect implements SecureChannel {
 		this.getTypeMessage(MSG_PAIR_REJECT).then(
 			() => {
 				waitForPairing.reject(
-					new SConnectError(
-						"PAIRING_FAILED",
-						"Pairing request was rejected",
-					),
+					new SConnectError("PAIRING_FAILED", "Pairing request was rejected"),
 				);
 			},
 			() => {
@@ -472,10 +490,7 @@ export class SConnect implements SecureChannel {
 
 		if (!this.signalAdapter.supportNativeEncryption) {
 			const iAmLow = compareBytes(myBlinded, otherBlinded) < 0;
-			this.cipher = new cipher(
-				iAmLow ? k1 : k2,
-				iAmLow ? k2 : k1,
-			);
+			this.cipher = new cipher(iAmLow ? k1 : k2, iAmLow ? k2 : k1);
 		}
 
 		this.setState("Connected");
@@ -653,6 +668,12 @@ export class SConnect implements SecureChannel {
 				return;
 			}
 
+			// 告示消息在验证前的任何非 Idle 状态都处理（明文、未认证）
+			if (type === MSG_PREINFO && this.state !== "Idle") {
+				this.handlePreInfo(payload);
+				return;
+			}
+
 			const handlers = this.typeMessageResolvers.get(type);
 			if (handlers) {
 				handlers.resolve(payload);
@@ -676,6 +697,13 @@ export class SConnect implements SecureChannel {
 					return;
 			}
 		}
+	}
+
+	private handlePreInfo(payload: Uint8Array): void {
+		if (payload.length > 1024) return; // 超长消息直接丢弃
+		if (!this.preInfoLimiter.canExecute()) return; // 防止告示消息刷屏
+		const text = new TextDecoder().decode(payload);
+		this.emit("preInfo", text);
 	}
 
 	private async handleAppData(data: Uint8Array): Promise<void> {
@@ -1035,16 +1063,9 @@ function buildPairingTranscript(
 	const [idLow, idHigh] = [enc.encode(id1), enc.encode(id2)].sort((x, y) =>
 		compareBytes(x, y),
 	);
-	const [bLow, bHigh] = [blinded1, blinded2].sort((x, y) =>
-		compareBytes(x, y),
-	);
-	return concatUint8Arrays([
-		enc.encode(pin),
-		idLow,
-		idHigh,
-		bLow,
-		bHigh,
-	]).buffer as ArrayBuffer;
+	const [bLow, bHigh] = [blinded1, blinded2].sort((x, y) => compareBytes(x, y));
+	return concatUint8Arrays([enc.encode(pin), idLow, idHigh, bLow, bHigh])
+		.buffer as ArrayBuffer;
 }
 
 function buildConnectionTranscript(
@@ -1058,8 +1079,7 @@ function buildConnectionTranscript(
 		compareBytes(x, y),
 	);
 	const [pLow, pHigh] = [pub1, pub2].sort((x, y) => compareBytes(x, y));
-	return concatUint8Arrays([idLow, idHigh, pLow, pHigh])
-		.buffer as ArrayBuffer;
+	return concatUint8Arrays([idLow, idHigh, pLow, pHigh]).buffer as ArrayBuffer;
 }
 
 async function derive(

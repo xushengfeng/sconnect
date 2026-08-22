@@ -84,6 +84,16 @@ export declare class SecureChannel {
 	 */
 	sendBinary(data: ArrayBuffer | Uint8Array): Promise<void>;
 
+	// ================= 验证前交流（明文、未认证） =================
+
+	/**
+	 * 在配对/身份验证之前发送明文告示消息，对方通过 preInfo 事件接收。
+	 * 仅在 Ready / Handshaking 状态可用（即适配器已建立连接后）。
+	 * 单条最长 1024 字节，且受频率限制。
+	 * 注意：明文未认证，不可用于传递敏感信息。
+	 */
+	sendPreInfo(text: string): Promise<void>;
+
 	// ================= 事件订阅 =================
 
 	/**
@@ -178,6 +188,8 @@ interface ChannelOptions {
 	pairInterval?: number;
 	/** 连接请求间隔限制（毫秒），默认 20 */
 	connectInterval?: number;
+	/** 告示消息（preInfo）接收间隔限制（毫秒），默认 200 */
+	preInfoInterval?: number;
 }
 
 interface CredentialPublicInfo {
@@ -233,6 +245,8 @@ export type SecureChannelEvents = {
 	error: (err: SConnectError) => void;
 	pairRequest: (request: PairRequest) => void;
 	connectRequest: (request: ConnectRequest) => void;
+	/** 收到验证前的明文告示消息（未认证，不可作为信任依据） */
+	preInfo: (text: string) => void;
 };
 
 // ================= 状态类型 =================

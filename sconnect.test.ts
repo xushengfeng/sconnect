@@ -685,6 +685,42 @@ describe("SConnect", () => {
 		});
 	});
 
+	describe("验证前交流（明文告示）", () => {
+		it("配对前可双向发送明文告示消息 sendPreInfo", async () => {
+			const [adapterA, adapterB] = UntrustedLoopbackAdapterManager.createPair();
+			const channelA = new SConnect(adapterA, { handshakeTimeout: 10000 });
+			const channelB = new SConnect(adapterB, { handshakeTimeout: 10000 });
+
+			await channelA.init("device-a");
+			await channelB.init("device-b");
+
+			const preInfoPromise = new Promise<string>((resolve) => {
+				channelB.on("preInfo", resolve);
+			});
+
+			// pairInit 内部建立适配器连接，之后 A 即可发送告示
+			await channelA.pairInit({
+				myDeviceId: "device-a",
+				remoteDeviceId: "device-b",
+			});
+			await channelA.sendPreInfo("hello, 我是 device-a");
+
+			expect(await preInfoPromise).toBe("hello, 我是 device-a");
+
+			channelA.disconnect();
+			channelB.disconnect();
+		});
+
+		it("未连接时 sendPreInfo 应抛出错误", async () => {
+			const [adapterA] = UntrustedLoopbackAdapterManager.createPair();
+			const channelA = new SConnect(adapterA);
+
+			await channelA.init("device-a");
+
+			await expect(channelA.sendPreInfo("hi")).rejects.toThrow();
+		});
+	});
+
 	describe("事件系统", () => {
 		it("应触发 ready 和 disconnect 事件", async () => {
 			const [adapterA, adapterB] = LoopbackAdapterManager.createPair();
