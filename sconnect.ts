@@ -674,21 +674,30 @@ export class SConnect implements SecureChannel {
 	}
 
 	private async handleAppData(data: Uint8Array): Promise<void> {
-		let payload = data;
-
 		if (this.cipher) {
+			let payload: Uint8Array;
 			try {
-				payload = new Uint8Array(await this.cipher.decrypt(payload));
+				payload = new Uint8Array(await this.cipher.decrypt(data));
 			} catch {
-				this.emit("data", new Uint8Array(payload).buffer as ArrayBuffer, () =>
-					this.textDecoder.decode(payload),
+				this.emit(
+					"error",
+					new SConnectError(
+						"CREDENTIAL_INVALID",
+						"Failed to decrypt incoming message",
+						false,
+					),
 				);
+				this.disconnect();
 				return;
 			}
+			this.emit("data", payload.buffer as ArrayBuffer, () =>
+				this.textDecoder.decode(payload),
+			);
+			return;
 		}
 
-		this.emit("data", payload.buffer as ArrayBuffer, () =>
-			this.textDecoder.decode(payload),
+		this.emit("data", data.buffer as ArrayBuffer, () =>
+			this.textDecoder.decode(data),
 		);
 	}
 
