@@ -370,44 +370,44 @@ describe("SConnect", () => {
 			await channelA.init("device-a");
 			await channelB.init("device-b");
 
-		let rawSentData: Uint8Array | null = null;
-		const originalSend = adapterA.send.bind(adapterA);
-		adapterA.send = async (data: Uint8Array) => {
-			rawSentData = new Uint8Array(data);
-			return originalSend(data);
-		};
+			let rawSentData: Uint8Array | null = null;
+			const originalSend = adapterA.send.bind(adapterA);
+			adapterA.send = async (data: Uint8Array) => {
+				rawSentData = new Uint8Array(data);
+				return originalSend(data);
+			};
 
-		const receivedMessages: string[] = [];
-		channelB.on("data", (_, text) => receivedMessages.push(text()));
+			const receivedMessages: string[] = [];
+			channelB.on("data", (_, text) => receivedMessages.push(text()));
 
-		// B 监听配对请求
-		const pairRequestPromise = new Promise<PairRequest>((resolve) => {
-			channelB.on("pairRequest", (request) => {
-				resolve(request);
+			// B 监听配对请求
+			const pairRequestPromise = new Promise<PairRequest>((resolve) => {
+				channelB.on("pairRequest", (request) => {
+					resolve(request);
+				});
 			});
-		});
 
-		// A 发起配对
-		const pairingA = await channelA.pairInit({
-			myDeviceId: "device-a",
-			remoteDeviceId: "device-b",
-		});
+			// A 发起配对
+			const pairingA = await channelA.pairInit({
+				myDeviceId: "device-a",
+				remoteDeviceId: "device-b",
+			});
 
-		const pairRequest = await pairRequestPromise;
-		pairRequest.inputOtherPin(pairingA.pin);
-		const credentialBPromise = pairRequest.waitForPairing();
-		const credentialAPromise = pairingA.waitForPairing();
+			const pairRequest = await pairRequestPromise;
+			pairRequest.inputOtherPin(pairingA.pin);
+			const credentialBPromise = pairRequest.waitForPairing();
+			const credentialAPromise = pairingA.waitForPairing();
 
-		await Promise.all([credentialAPromise, credentialBPromise]);
+			await Promise.all([credentialAPromise, credentialBPromise]);
 
-		const testMessage = "should be encrypted";
-		await channelA.send(testMessage);
-		await new Promise((r) => setTimeout(r, 100));
+			const testMessage = "should be encrypted";
+			await channelA.send(testMessage);
+			await new Promise((r) => setTimeout(r, 100));
 
-		expect(rawSentData).not.toBeNull();
-		expect(new TextDecoder().decode(rawSentData!)).not.toBe(testMessage);
-		// 双向密钥一致，B 必须能真正解密
-		expect(receivedMessages).toContain(testMessage);
+			expect(rawSentData).not.toBeNull();
+			expect(new TextDecoder().decode(rawSentData!)).not.toBe(testMessage);
+			// 双向密钥一致，B 必须能真正解密
+			expect(receivedMessages).toContain(testMessage);
 
 			channelA.disconnect();
 			channelB.disconnect();
@@ -543,8 +543,6 @@ describe("SConnect", () => {
 				myPrivateKey: keyPairB.privateKey,
 				myPublicKey: keyPairB.publicKey,
 				remotePublicKey: keyPairA.publicKey,
-				myDeviceId: "device-b",
-				remoteDeviceId: "device-a",
 			});
 
 			const [resultA, resultB] = await Promise.all([
@@ -672,8 +670,6 @@ describe("SConnect", () => {
 				myPrivateKey: keyPairB.privateKey,
 				myPublicKey: keyPairB.publicKey,
 				remotePublicKey: keyPairA.publicKey,
-				myDeviceId: "device-b",
-				remoteDeviceId: "device-a",
 			});
 
 			await Promise.all([resultAPromise, resultBPromise]);
@@ -932,12 +928,10 @@ describe("密码学验证", () => {
 			const sender = new cipher(key, key);
 			const receiver = new cipher(key, key);
 
-			const encrypted = await sender.encrypt(
-				new TextEncoder().encode("first"),
+			const encrypted = await sender.encrypt(new TextEncoder().encode("first"));
+			expect(new TextDecoder().decode(await receiver.decrypt(encrypted))).toBe(
+				"first",
 			);
-			expect(
-				new TextDecoder().decode(await receiver.decrypt(encrypted)),
-			).toBe("first");
 			await expect(receiver.decrypt(encrypted)).rejects.toThrow();
 		});
 
@@ -952,12 +946,8 @@ describe("密码学验证", () => {
 			// m2 先到（乱序），接收方计数器还在 0，必须被拒绝
 			await expect(receiver.decrypt(m2)).rejects.toThrow();
 			// 且乱序失败不推进计数器，后续按序消息仍正常
-			expect(new TextDecoder().decode(await receiver.decrypt(m1))).toBe(
-				"one",
-			);
-			expect(new TextDecoder().decode(await receiver.decrypt(m2))).toBe(
-				"two",
-			);
+			expect(new TextDecoder().decode(await receiver.decrypt(m1))).toBe("one");
+			expect(new TextDecoder().decode(await receiver.decrypt(m2))).toBe("two");
 		});
 
 		it("AES-GCM 不同密钥解密失败", async () => {
