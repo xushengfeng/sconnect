@@ -316,6 +316,51 @@ describe("SConnect", () => {
 			channelB.disconnect();
 		});
 
+		it("PIN 错误超限后自动拒绝后续配对请求", async () => {
+			const [adapterA, adapterB] =
+				UntrustedLoopbackAdapterManager.createPair(false);
+			const opts = {
+				handshakeTimeout: 500,
+				pairInterval: 0,
+				maxPinAttempts: 2,
+			};
+			const channelA = new SConnect(adapterA, opts);
+			const channelB = new SConnect(adapterB, opts);
+
+			await channelA.init("device-a");
+			await channelB.init("device-b");
+
+			const requests: PairRequest[] = [];
+			channelB.on("pairRequest", (request) => {
+				requests.push(request);
+			});
+
+			// 连续两次输错 PIN
+			for (let i = 0; i < 2; i++) {
+				const pairingA = await channelA.pairInit({
+					myDeviceId: "device-a",
+					remoteDeviceId: "device-b",
+				});
+				const aDone = pairingA.waitForPairing();
+				await new Promise((r) => setTimeout(r, 20));
+				const request = requests[i];
+				request.inputOtherPin("000000");
+				await expect(request.waitForPairing()).rejects.toThrow();
+				await expect(aDone).rejects.toThrow();
+			}
+
+			// 第三次：B 不再触发 pairRequest，A 直接被拒
+			const pairingA3 = await channelA.pairInit({
+				myDeviceId: "device-a",
+				remoteDeviceId: "device-b",
+			});
+			await expect(pairingA3.waitForPairing()).rejects.toThrow();
+			expect(requests.length).toBe(2);
+
+			channelA.disconnect();
+			channelB.disconnect();
+		});
+
 		it("PAKE 配对后消息应被加密 (supportNativeEncryption=false)", async () => {
 			const [adapterA, adapterB] =
 				UntrustedLoopbackAdapterManager.createPair(false);

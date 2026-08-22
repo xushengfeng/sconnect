@@ -113,6 +113,7 @@ export class SConnect implements SecureChannel {
 
 	private pairLimiter: Limiter;
 	private connectLimiter: Limiter;
+	private failedPinAttempts = 0;
 
 	private textDecoder = new TextDecoder();
 
@@ -366,11 +367,19 @@ export class SConnect implements SecureChannel {
 			new TextEncoder().encode(this.myDeviceId),
 		).catch(() => {});
 
-		this.getTypeMessage(MSG_PAIR_REJECT).then(() => {
-			waitForPairing.reject(
-				new SConnectError("PAIRING_FAILED", "Pairing request was rejected"),
-			);
-		});
+		this.getTypeMessage(MSG_PAIR_REJECT).then(
+			() => {
+				waitForPairing.reject(
+					new SConnectError(
+						"PAIRING_FAILED",
+						"Pairing request was rejected",
+					),
+				);
+			},
+			() => {
+				// 未收到拒绝（如超时）时静默忽略
+			},
+		);
 
 		return {
 			pin,
@@ -438,8 +447,11 @@ export class SConnect implements SecureChannel {
 		await this.sendTypeMessage(MSG_SPAKE_DATA, confirmMac);
 		const otherMac = await this.getTypeMessage(MSG_SPAKE_DATA);
 		if (!verify(otherMac, confirmMac)) {
+			// 记录失败的 PIN 尝试（MAC 校验失败意味着对方 PIN 不对）
+			this.failedPinAttempts++;
 			throw new SConnectError("PAIRING_FAILED", "Pairing verification failed");
 		}
+		this.failedPinAttempts = 0;
 
 		// todo 派生
 		const signingKeyPair = await generateSigningKeyPair();
@@ -479,6 +491,11 @@ export class SConnect implements SecureChannel {
 	}
 
 	private handlePairRequest(payload: Uint8Array): void {
+		if (this.failedPinAttempts >= this.options.maxPinAttempts) {
+			// PIN 错误次数超限，直接拒绝后续配对请求（在线暴力破解防护）
+			this.sendTypeMessage(MSG_PAIR_REJECT).catch(() => {});
+			return;
+		}
 		if (!this.pairLimiter.canExecute()) {
 			// 考虑到id都是临时可变的，无法区分真实设备，所以全部限制
 			// todo 中间信息攻击，比如useyourpin dos，或者其它，需要状态机限制顺序和个数
