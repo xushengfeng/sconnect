@@ -790,7 +790,16 @@ export class SConnect implements SecureChannel {
 	}
 
 	private generatePin(): string {
-		return Math.floor(100000 + Math.random() * 900000).toString();
+		// 拒绝采样避免模偏差，均匀覆盖 [100000, 999999]
+		const range = 900000;
+		const max = Math.floor(0x100000000 / range) * range;
+		const buf = new Uint32Array(1);
+		let v: number;
+		do {
+			crypto.getRandomValues(buf);
+			v = buf[0];
+		} while (v >= max);
+		return (100000 + (v % range)).toString();
 	}
 
 	private validatePin(pin: string): boolean {
