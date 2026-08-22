@@ -859,6 +859,39 @@ describe("密码学验证", () => {
 			expect(encrypted.length).toBeGreaterThanOrEqual(28);
 		});
 
+		it("重放同一条密文解密失败", async () => {
+			const key = crypto.getRandomValues(new Uint8Array(32));
+			const sender = new cipher(key, key);
+			const receiver = new cipher(key, key);
+
+			const encrypted = await sender.encrypt(
+				new TextEncoder().encode("first"),
+			);
+			expect(
+				new TextDecoder().decode(await receiver.decrypt(encrypted)),
+			).toBe("first");
+			await expect(receiver.decrypt(encrypted)).rejects.toThrow();
+		});
+
+		it("乱序消息解密失败", async () => {
+			const key = crypto.getRandomValues(new Uint8Array(32));
+			const sender = new cipher(key, key);
+			const receiver = new cipher(key, key);
+
+			const m1 = await sender.encrypt(new TextEncoder().encode("one"));
+			const m2 = await sender.encrypt(new TextEncoder().encode("two"));
+
+			// m2 先到（乱序），接收方计数器还在 0，必须被拒绝
+			await expect(receiver.decrypt(m2)).rejects.toThrow();
+			// 且乱序失败不推进计数器，后续按序消息仍正常
+			expect(new TextDecoder().decode(await receiver.decrypt(m1))).toBe(
+				"one",
+			);
+			expect(new TextDecoder().decode(await receiver.decrypt(m2))).toBe(
+				"two",
+			);
+		});
+
 		it("AES-GCM 不同密钥解密失败", async () => {
 			const key1 = crypto.getRandomValues(new Uint8Array(32));
 			const key2 = crypto.getRandomValues(new Uint8Array(32));

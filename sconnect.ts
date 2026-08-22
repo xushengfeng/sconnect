@@ -868,11 +868,20 @@ export async function generateSigningKeyPair(): Promise<KeyPair> {
 export class cipher {
 	private sendCryptoKey: CryptoKey | null = null;
 	private receiveCryptoKey: CryptoKey | null = null;
+	// 消息计数器，作为 GCM 的 AAD 防重放：重放/乱序的消息解密必然失败
+	private sendCounter = 0;
+	private receiveCounter = 0;
 
 	constructor(
 		private sendKey: Uint8Array,
 		private receiveKey: Uint8Array,
 	) {}
+
+	private counterToAad(counter: number): Uint8Array {
+		const aad = new Uint8Array(8);
+		new DataView(aad.buffer).setBigUint64(0, BigInt(counter));
+		return aad;
+	}
 
 	private async getSendKey(): Promise<CryptoKey> {
 		if (!this.sendCryptoKey) {
@@ -903,11 +912,17 @@ export class cipher {
 	async encrypt(data: Uint8Array): Promise<Uint8Array> {
 		const key = await this.getSendKey();
 		const iv = crypto.getRandomValues(new Uint8Array(12));
+		const aad = this.counterToAad(this.sendCounter);
 		const encrypted = await crypto.subtle.encrypt(
-			{ name: "AES-GCM", iv },
+			{
+				name: "AES-GCM",
+				iv,
+				additionalData: aad as unknown as BufferSource,
+			},
 			key,
 			data as unknown as BufferSource,
 		);
+		this.sendCounter++;
 		const result = new Uint8Array(iv.length + encrypted.byteLength);
 		result.set(iv);
 		result.set(new Uint8Array(encrypted), iv.length);
@@ -919,10 +934,17 @@ export class cipher {
 		const iv = new Uint8Array(data.buffer, data.byteOffset, 12);
 		const ciphertext = new Uint8Array(data.buffer, data.byteOffset + 12);
 		const decrypted = await crypto.subtle.decrypt(
-			{ name: "AES-GCM", iv: iv as unknown as BufferSource },
+			{
+				name: "AES-GCM",
+				iv: iv as unknown as BufferSource,
+				additionalData: this.counterToAad(
+					this.receiveCounter,
+				) as unknown as BufferSource,
+			},
 			key,
 			ciphertext as unknown as BufferSource,
 		);
+		this.receiveCounter++;
 		return new Uint8Array(decrypted);
 	}
 }
