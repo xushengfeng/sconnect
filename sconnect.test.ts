@@ -341,12 +341,13 @@ describe("SConnect", () => {
 					myDeviceId: "device-a",
 					remoteDeviceId: "device-b",
 				});
-				const aDone = pairingA.waitForPairing();
+				// handler 必须立即挂上，否则 rejection 先于 handler 到达会报 unhandled
+				const aDone = expect(pairingA.waitForPairing()).rejects.toThrow();
 				await new Promise((r) => setTimeout(r, 20));
 				const request = requests[i];
 				request.inputOtherPin("000000");
 				await expect(request.waitForPairing()).rejects.toThrow();
-				await expect(aDone).rejects.toThrow();
+				await aDone;
 			}
 
 			// 第三次：B 不再触发 pairRequest，A 直接被拒

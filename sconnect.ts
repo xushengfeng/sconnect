@@ -224,6 +224,10 @@ export class SConnect implements SecureChannel {
 		const m = concatUint8Arrays([eph.publicKey, ephSig]);
 		await this.sendTypeMessage(MSG_CONNECT_PUBLIC_KEY, m);
 		const otherM = await this.getTypeMessage(MSG_CONNECT_PUBLIC_KEY);
+		if (otherM.length !== eph.publicKey.length + 64) {
+			this.setState("Ready");
+			return { success: false, reason: "NEEDS_PAIRING" };
+		}
 		const otherPubKey = otherM.subarray(0, eph.publicKey.length);
 		const otherSig = otherM.subarray(eph.publicKey.length);
 		const sigValid = await verifySignature(
@@ -245,20 +249,30 @@ export class SConnect implements SecureChannel {
 			eph.publicKey,
 			otherPubKey,
 		);
-		const material = await derive(dhSecret, transcript, new Uint8Array(0), 512);
+		const material = await derive(dhSecret, transcript, new Uint8Array(0), 768);
 		const k1 = material.subarray(0, 32);
 		const k2 = material.subarray(32, 64);
+		const kConfirm = material.subarray(64, 96);
+		const iAmLow = compareBytes(eph.publicKey, otherPubKey) < 0;
 
-		const confirmMac = await mac(k1, transcript);
+		// 方向性密钥确认：双方角色相反、MAC 输入带角色标签，
+		// 对端反射我方 MAC 无法通过校验（C1）
+		const confirmMac = await mac(
+			kConfirm,
+			buildConfirmData(iAmLow ? "low" : "high", transcript),
+		);
 		await this.sendTypeMessage(MSG_CONNECT_MAC_VER, confirmMac);
 		const otherMac = await this.getTypeMessage(MSG_CONNECT_MAC_VER);
-		if (!verify(otherMac, confirmMac)) {
+		const expectedMac = await mac(
+			kConfirm,
+			buildConfirmData(iAmLow ? "high" : "low", transcript),
+		);
+		if (!verify(otherMac, expectedMac)) {
 			this.setState("Ready");
 			return { success: false, reason: "NEEDS_PAIRING" };
 		}
 
 		if (!this.signalAdapter.supportNativeEncryption) {
-			const iAmLow = compareBytes(eph.publicKey, otherPubKey) < 0;
 			this.cipher = new cipher(iAmLow ? k1 : k2, iAmLow ? k2 : k1);
 		}
 		this.setState("Connected");
@@ -368,6 +382,8 @@ export class SConnect implements SecureChannel {
 		await this.signalAdapter.connect(credential.remoteDeviceId);
 
 		const otherPin = Promise.withResolvers<string>();
+		// 应用层可能不调用 waitForPairing，预挂空处理避免 unhandled rejection
+		otherPin.promise.catch(() => {});
 
 		const inputOtherPin = (remotePin: string) => {
 			if (!this.validatePin(remotePin)) {
@@ -381,6 +397,7 @@ export class SConnect implements SecureChannel {
 		};
 
 		const waitForPairing = Promise.withResolvers<Credential>();
+		waitForPairing.promise.catch(() => {});
 
 		// 发送配对请求
 		this.sendTypeMessage(
@@ -421,17 +438,28 @@ export class SConnect implements SecureChannel {
 		PIN: string;
 	}): Promise<Credential> {
 		const keyPair = await generateKeyPair();
-		const finalPin = await Promise.race([
-			(async () => {
-				const pin = await op.otherPin;
-				await this.sendTypeMessage(MSG_USE_YOUR_PIN);
-				return pin;
-			})(),
-			(async () => {
-				await this.getTypeMessage(MSG_USE_YOUR_PIN);
-				return op.PIN;
-			})(),
-		]);
+		const pinFromOther = (async () => {
+			const pin = await op.otherPin;
+			await this.sendTypeMessage(MSG_USE_YOUR_PIN);
+			return pin;
+		})();
+		const pinFromMine = (async () => {
+			await this.getTypeMessage(MSG_USE_YOUR_PIN);
+			return op.PIN;
+		})();
+		// 落败分支稍后可能超时 reject，挂空处理避免 unhandled rejection
+		pinFromOther.catch(() => {});
+		pinFromMine.catch(() => {});
+		const finalPin = await Promise.race([pinFromOther, pinFromMine]);
+
+		// C2：PIN 是会话密钥的唯一秘密来源。空/非法 PIN（如接收方未生成 PIN
+		// 时被 MSG_USE_YOUR_PIN 强制生效）意味着攻击者可预知密钥，必须拒绝
+		if (!this.validatePin(finalPin)) {
+			throw new SConnectError(
+				"PIN_INVALID",
+				"Pairing requires a valid 6-digit PIN",
+			);
+		}
 
 		// SPEKE 风格 PAKE：双方各自与 PIN 派生的"生成元"做 DH，
 		// 线上只出现被随机私钥盲化后的值，窃听者无法离线验证 PIN 猜测
@@ -439,7 +467,7 @@ export class SConnect implements SecureChannel {
 		const myBlinded = await dh(keyPair.privateKey, pinPoint);
 		await this.sendTypeMessage(MSG_BLIND_PUBLIC_KEY, myBlinded);
 		const otherBlinded = await this.getTypeMessage(MSG_BLIND_PUBLIC_KEY);
-		if (!otherBlinded) {
+		if (!otherBlinded || otherBlinded.length !== 32) {
 			throw new SConnectError(
 				"PAIRING_FAILED",
 				"Failed to receive blinded public key from peer",
@@ -447,31 +475,8 @@ export class SConnect implements SecureChannel {
 		}
 		const s = await dh(keyPair.privateKey, otherBlinded);
 
-		// 双方按字典序规范化 transcript，保证派生出相同的密钥材料
-		const transcript = buildPairingTranscript(
-			finalPin,
-			this.myDeviceId,
-			op.remoteDeviceId,
-			myBlinded,
-			otherBlinded,
-		);
-		const pinBytes = new TextEncoder().encode(finalPin);
-		const material = await derive(s, transcript, pinBytes, 512);
-		const k1 = material.subarray(0, 32);
-		const k2 = material.subarray(32, 64);
-
-		// 密钥确认：PIN 不一致时双方密钥不同，MAC 校验必然失败
-		const confirmMac = await mac(k1, transcript);
-		await this.sendTypeMessage(MSG_SPAKE_DATA, confirmMac);
-		const otherMac = await this.getTypeMessage(MSG_SPAKE_DATA);
-		if (!verify(otherMac, confirmMac)) {
-			// 记录失败的 PIN 尝试（MAC 校验失败意味着对方 PIN 不对）
-			this.failedPinAttempts++;
-			throw new SConnectError("PAIRING_FAILED", "Pairing verification failed");
-		}
-		this.failedPinAttempts = 0;
-
-		// todo 派生
+		// C3：先交换长期身份公钥，随后纳入 transcript 做密钥确认。
+		// 中间人替换任一公钥都会使双方 transcript 不一致，MAC 校验必然失败
 		const signingKeyPair = await generateSigningKeyPair();
 		await this.sendTypeMessage(
 			MSG_SIGNING_PUBLIC_KEY,
@@ -481,15 +486,51 @@ export class SConnect implements SecureChannel {
 			MSG_SIGNING_PUBLIC_KEY,
 		);
 
-		if (!remoteSigningPublicKey) {
+		if (!remoteSigningPublicKey || remoteSigningPublicKey.length !== 32) {
 			throw new SConnectError(
 				"PAIRING_FAILED",
 				"Failed to receive signing public key",
 			);
 		}
 
+		// 双方按字典序规范化 transcript（身份公钥与设备 ID 绑定），
+		// 保证派生出相同的密钥材料
+		const transcript = buildPairingTranscript(
+			finalPin,
+			this.myDeviceId,
+			op.remoteDeviceId,
+			myBlinded,
+			otherBlinded,
+			signingKeyPair.publicKey,
+			remoteSigningPublicKey,
+		);
+		const pinBytes = new TextEncoder().encode(finalPin);
+		const material = await derive(s, transcript, pinBytes, 768);
+		const k1 = material.subarray(0, 32);
+		const k2 = material.subarray(32, 64);
+		const kConfirm = material.subarray(64, 96);
+		const iAmLow = compareBytes(myBlinded, otherBlinded) < 0;
+
+		// C1：方向性密钥确认。双方角色相反，MAC 输入带角色标签，
+		// 对端反射我方 MAC 无法通过校验；PIN 不一致时密钥不同同样失败
+		const confirmMac = await mac(
+			kConfirm,
+			buildConfirmData(iAmLow ? "low" : "high", transcript),
+		);
+		await this.sendTypeMessage(MSG_SPAKE_DATA, confirmMac);
+		const otherMac = await this.getTypeMessage(MSG_SPAKE_DATA);
+		const expectedMac = await mac(
+			kConfirm,
+			buildConfirmData(iAmLow ? "high" : "low", transcript),
+		);
+		if (!verify(otherMac, expectedMac)) {
+			// 记录失败的 PIN 尝试（MAC 校验失败意味着对方 PIN 不对或存在攻击）
+			this.failedPinAttempts++;
+			throw new SConnectError("PAIRING_FAILED", "Pairing verification failed");
+		}
+		this.failedPinAttempts = 0;
+
 		if (!this.signalAdapter.supportNativeEncryption) {
-			const iAmLow = compareBytes(myBlinded, otherBlinded) < 0;
 			this.cipher = new cipher(iAmLow ? k1 : k2, iAmLow ? k2 : k1);
 		}
 
@@ -523,6 +564,8 @@ export class SConnect implements SecureChannel {
 		const senderId = new TextDecoder().decode(payload);
 
 		const otherPin = Promise.withResolvers<string>();
+		// 应用层可能不调用 waitForPairing，预挂空处理避免 unhandled rejection
+		otherPin.promise.catch(() => {});
 
 		const request: PairRequest = {
 			remoteDeviceId: senderId,
@@ -1050,6 +1093,27 @@ function compareBytes(a: Uint8Array, b: Uint8Array): number {
 	return a.length - b.length;
 }
 
+// transcript 中把设备 ID 与身份公钥绑定为一个条目（ID 加长度前缀避免歧义），
+// 再按字典序排列，防止中间人把公钥换绑到另一个 ID
+function bindIdentity(id: Uint8Array, key: Uint8Array): Uint8Array {
+	const out = new Uint8Array(2 + id.length + key.length);
+	new DataView(out.buffer).setUint16(0, id.length);
+	out.set(id, 2);
+	out.set(key, 2 + id.length);
+	return out;
+}
+
+// 密钥确认 MAC 的方向性标签：双方角色相反、MAC 输入不同，
+// 对端反射我方 MAC 无法通过校验
+function buildConfirmData(role: string, transcript: ArrayBuffer): ArrayBuffer {
+	const enc = new TextEncoder();
+	return concatUint8Arrays([
+		enc.encode("SConnect-confirm-v1:"),
+		enc.encode(role),
+		new Uint8Array(transcript),
+	]).buffer as ArrayBuffer;
+}
+
 // transcript 的字段按字典序排列，与消息收发顺序无关，
 // 保证两端对同一次握手计算出完全相同的输入
 function buildPairingTranscript(
@@ -1058,13 +1122,16 @@ function buildPairingTranscript(
 	id2: string,
 	blinded1: Uint8Array,
 	blinded2: Uint8Array,
+	signPub1: Uint8Array,
+	signPub2: Uint8Array,
 ): ArrayBuffer {
 	const enc = new TextEncoder();
-	const [idLow, idHigh] = [enc.encode(id1), enc.encode(id2)].sort((x, y) =>
-		compareBytes(x, y),
-	);
+	const [iLow, iHigh] = [
+		bindIdentity(enc.encode(id1), signPub1),
+		bindIdentity(enc.encode(id2), signPub2),
+	].sort((x, y) => compareBytes(x, y));
 	const [bLow, bHigh] = [blinded1, blinded2].sort((x, y) => compareBytes(x, y));
-	return concatUint8Arrays([enc.encode(pin), idLow, idHigh, bLow, bHigh])
+	return concatUint8Arrays([enc.encode(pin), iLow, iHigh, bLow, bHigh])
 		.buffer as ArrayBuffer;
 }
 
@@ -1075,11 +1142,11 @@ function buildConnectionTranscript(
 	pub2: Uint8Array,
 ): ArrayBuffer {
 	const enc = new TextEncoder();
-	const [idLow, idHigh] = [enc.encode(id1), enc.encode(id2)].sort((x, y) =>
-		compareBytes(x, y),
-	);
-	const [pLow, pHigh] = [pub1, pub2].sort((x, y) => compareBytes(x, y));
-	return concatUint8Arrays([idLow, idHigh, pLow, pHigh]).buffer as ArrayBuffer;
+	const [iLow, iHigh] = [
+		bindIdentity(enc.encode(id1), pub1),
+		bindIdentity(enc.encode(id2), pub2),
+	].sort((x, y) => compareBytes(x, y));
+	return concatUint8Arrays([iLow, iHigh]).buffer as ArrayBuffer;
 }
 
 async function derive(
