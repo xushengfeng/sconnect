@@ -45,7 +45,10 @@ export declare class SecureChannel {
 	 * 内部将使用该凭证与对方执行基于长期密钥的握手（如 Noise IK）。
 	 *
 	 * @returns 若成功，返回 `{ success: true, credential }`，其中 credential 可能更新了 lastConnected；
-	 *          若失败（凭证失效、对方无记录等），返回 `{ success: false }`，需重新走配对流程。
+	 *          若 `reason: "NEEDS_PAIRING"`，表示对方无记录/拒绝，需重新走配对流程；
+	 *          若 `reason: "AUTH_FAILED"`，表示对方未能证明身份（可能是握手被篡改），
+	 *          应用应警示用户，不要静默降级为重新配对；
+	 *          其它失败（如超时）返回 `{ success: false }`。
 	 */
 	tryConnect(credential?: CredentialPrivateInfo): Promise<ConnectResult>;
 
@@ -229,6 +232,7 @@ interface ConnectSuccess {
 
 interface ConnectFailed {
 	success: false;
+	reason?: undefined;
 }
 
 interface ConnectNeedsPairing {
@@ -236,7 +240,21 @@ interface ConnectNeedsPairing {
 	reason: "NEEDS_PAIRING";
 }
 
-type ConnectResult = ConnectSuccess | ConnectFailed | ConnectNeedsPairing;
+/**
+ * 身份验证失败：对方未能证明其身份（签名或 MAC 校验未通过）。
+ * 可能是握手被篡改（中间人），也可能是对方凭证已失效。
+ * 应用应警示用户，不要静默降级为重新配对。
+ */
+interface ConnectAuthFailed {
+	success: false;
+	reason: "AUTH_FAILED";
+}
+
+type ConnectResult =
+	| ConnectSuccess
+	| ConnectFailed
+	| ConnectNeedsPairing
+	| ConnectAuthFailed;
 
 export type SecureChannelEvents = {
 	ready: () => void;

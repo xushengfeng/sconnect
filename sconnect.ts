@@ -32,6 +32,22 @@ const MSG_CONNECT_MAC_VER = 14;
 const MSG_SIGNING_PUBLIC_KEY = 15;
 const MSG_PREINFO = 16; // 验证前的明文告示消息（未认证，仅供展示）
 
+// 已知协议消息类型白名单：其余类型一律丢弃（防止队列被未知消息灌满）
+const KNOWN_MSG_TYPES: ReadonlySet<number> = new Set([
+	MSG_PAIR_REQUEST,
+	MSG_USE_YOUR_PIN,
+	MSG_PAIR_REJECT,
+	MSG_CONNECT_REQUEST,
+	MSG_CONNECT_ACCEPT,
+	MSG_ERROR,
+	MSG_SPAKE_DATA,
+	MSG_BLIND_PUBLIC_KEY,
+	MSG_CONNECT_PUBLIC_KEY,
+	MSG_CONNECT_MAC_VER,
+	MSG_SIGNING_PUBLIC_KEY,
+	MSG_PREINFO,
+]);
+
 // 错误类
 class SConnectError extends Error {
 	code: ErrorCode;
@@ -102,6 +118,8 @@ export class SConnect implements SecureChannel {
 	// 状态机
 	private state: ChannelState = "Idle";
 	private handshakeType: HandshakeType = null;
+	// 握手进行中标志：期间不派发新的配对/连接请求（防止中途被新请求打断）
+	private handshakeActive = false;
 	private typeMessageQueue: { type: number; payload: Uint8Array }[] = [];
 	private typeMessageResolvers: Map<
 		number,
@@ -175,6 +193,8 @@ export class SConnect implements SecureChannel {
 			await this.signalAdapter.connect(this.remoteId);
 
 			if (this.signalAdapter.trustIdentity) {
+				this.resetHandshakeContext();
+				this.handshakeActive = true;
 				this.setState("Handshaking", "connect-request");
 				await this.sendTypeMessage(
 					MSG_CONNECT_REQUEST,
@@ -199,13 +219,20 @@ export class SConnect implements SecureChannel {
 				"myPrivateKey" in credential &&
 				credential.myPrivateKey
 			) {
+				this.resetHandshakeContext();
+				this.handshakeActive = true;
 				this.setState("Handshaking", "connect-request");
-				await this.sendTypeMessage(
-					MSG_CONNECT_REQUEST,
-					new TextEncoder().encode(this.myDeviceId),
-				);
-				const r = (await this.getTypeMessage(MSG_CONNECT_ACCEPT))[0];
-				if (r === 1) return this.connectWithCredential(credential);
+				try {
+					await this.sendTypeMessage(
+						MSG_CONNECT_REQUEST,
+						new TextEncoder().encode(this.myDeviceId),
+					);
+					const r = (await this.getTypeMessage(MSG_CONNECT_ACCEPT))[0];
+					if (r === 1) return this.connectWithCredential(credential);
+				} finally {
+					// 被拒绝/异常时回到 Ready（成功路径已切换到 Connected）
+					this.resetToReadyIfHandshaking();
+				}
 			}
 
 			return { success: false, reason: "NEEDS_PAIRING" };
@@ -219,6 +246,7 @@ export class SConnect implements SecureChannel {
 	private async connectWithCredential(
 		credential: CredentialPrivateInfo,
 	): Promise<ConnectResult> {
+		this.handshakeActive = true;
 		const eph = await generateKeyPair();
 		const ephSig = await sigh(credential.myPrivateKey, eph.publicKey);
 		const m = concatUint8Arrays([eph.publicKey, ephSig]);
@@ -226,7 +254,7 @@ export class SConnect implements SecureChannel {
 		const otherM = await this.getTypeMessage(MSG_CONNECT_PUBLIC_KEY);
 		if (otherM.length !== eph.publicKey.length + 64) {
 			this.setState("Ready");
-			return { success: false, reason: "NEEDS_PAIRING" };
+			return { success: false, reason: "AUTH_FAILED" };
 		}
 		const otherPubKey = otherM.subarray(0, eph.publicKey.length);
 		const otherSig = otherM.subarray(eph.publicKey.length);
@@ -236,8 +264,10 @@ export class SConnect implements SecureChannel {
 			otherSig,
 		);
 		if (!sigValid) {
+			// 对方未能用凭证中的公钥证明身份：可能是篡改或凭证失效，
+			// 必须与"无凭证需配对"区分开（H2）
 			this.setState("Ready");
-			return { success: false, reason: "NEEDS_PAIRING" };
+			return { success: false, reason: "AUTH_FAILED" };
 		}
 
 		const dhSecret = await dh(eph.privateKey, otherPubKey);
@@ -269,7 +299,7 @@ export class SConnect implements SecureChannel {
 		);
 		if (!verify(otherMac, expectedMac)) {
 			this.setState("Ready");
-			return { success: false, reason: "NEEDS_PAIRING" };
+			return { success: false, reason: "AUTH_FAILED" };
 		}
 
 		if (!this.signalAdapter.supportNativeEncryption) {
@@ -319,11 +349,15 @@ export class SConnect implements SecureChannel {
 			acceptWithCre: (
 				credential: CredentialPrivateInfo,
 			): Promise<ConnectResult> => {
+				this.handshakeActive = true;
 				this.setState("Handshaking", "connect-response");
 				this.sendTypeMessage(MSG_CONNECT_ACCEPT, new Uint8Array([1])).catch(
 					() => {},
 				);
-				return this.connectWithCredential(credential);
+				return this.connectWithCredential(credential).catch((err) => {
+					this.setState("Ready");
+					throw err;
+				});
 			},
 			reject: () => {
 				this.sendTypeMessage(MSG_CONNECT_ACCEPT, new Uint8Array([0])).catch(
@@ -332,6 +366,8 @@ export class SConnect implements SecureChannel {
 			},
 		};
 
+		// 新握手请求边界：清理上一会话残留，防止陈旧消息被误消费
+		this.resetHandshakeContext();
 		this.emit("connectRequest", request);
 	}
 
@@ -399,6 +435,9 @@ export class SConnect implements SecureChannel {
 		const waitForPairing = Promise.withResolvers<Credential>();
 		waitForPairing.promise.catch(() => {});
 
+		// 新握手请求边界：清理上一会话残留，防止陈旧消息被误消费
+		this.resetHandshakeContext();
+
 		// 发送配对请求
 		this.sendTypeMessage(
 			MSG_PAIR_REQUEST,
@@ -433,6 +472,19 @@ export class SConnect implements SecureChannel {
 	}
 
 	private async genWaitForPairing(op: {
+		remoteDeviceId: string;
+		otherPin: Promise<string>;
+		PIN: string;
+	}): Promise<Credential> {
+		this.handshakeActive = true;
+		try {
+			return await this.genWaitForPairingInner(op);
+		} finally {
+			this.handshakeActive = false;
+		}
+	}
+
+	private async genWaitForPairingInner(op: {
 		remoteDeviceId: string;
 		otherPin: Promise<string>;
 		PIN: string;
@@ -590,6 +642,8 @@ export class SConnect implements SecureChannel {
 			},
 		};
 
+		// 新握手请求边界：清理上一会话残留，防止陈旧消息被误消费
+		this.resetHandshakeContext();
 		this.emit("pairRequest", request);
 	}
 
@@ -599,6 +653,7 @@ export class SConnect implements SecureChannel {
 		if (this.state === "Idle") return;
 
 		this.cipher = null;
+		this.resetHandshakeContext();
 
 		this.signalAdapter.close();
 		this.setState("Ready");
@@ -607,6 +662,7 @@ export class SConnect implements SecureChannel {
 
 	destroy(): void {
 		this.cipher = null;
+		this.resetHandshakeContext();
 
 		this.signalAdapter.close();
 		this.myDeviceId = "";
@@ -672,6 +728,11 @@ export class SConnect implements SecureChannel {
 
 	// ================= 状态机 =================
 
+	// 独立方法避免调用点的类型收窄（TS 控制流会把 this.state 收窄成字面量）
+	private resetToReadyIfHandshaking(): void {
+		if (this.state === "Handshaking") this.setState("Ready");
+	}
+
 	private setState(
 		newState: ChannelState,
 		handshakeType?: HandshakeType,
@@ -680,6 +741,10 @@ export class SConnect implements SecureChannel {
 		this.state = newState;
 		this.handshakeType =
 			handshakeType ?? (newState === "Handshaking" ? this.handshakeType : null);
+
+		if (newState !== "Handshaking") {
+			this.handshakeActive = false;
+		}
 
 		// 状态改变时清理所有计时器
 		if (oldState !== newState) {
@@ -694,6 +759,31 @@ export class SConnect implements SecureChannel {
 			clearTimeout(timer);
 		}
 		this.activeTimers.clear();
+		// 挂起的握手等待必须结束，否则调用方的 Promise 将永远悬挂
+		this.rejectPendingWaiters(
+			new SConnectError("PEER_DISCONNECTED", "Handshake aborted"),
+		);
+	}
+
+	private rejectPendingWaiters(err: Error): void {
+		for (const resolver of this.typeMessageResolvers.values()) {
+			resolver.reject(err);
+		}
+		this.typeMessageResolvers.clear();
+	}
+
+	/**
+	 * 握手请求边界：清理上一会话残留的消息与等待者，
+	 * 防止跨会话/注入的陈旧消息被本次握手误消费。
+	 * 注意：只能在"发起/接收握手请求"时调用，不能在握手过程中调用
+	 * （对端可能已抢跑发来本次握手的消息，需保留）。
+	 */
+	private resetHandshakeContext(): void {
+		this.typeMessageQueue.length = 0;
+		this.rejectPendingWaiters(
+			new SConnectError("UNEXPECTED_MESSAGE", "Superseded by new handshake"),
+		);
+		this.handshakeActive = false;
 	}
 
 	// ================= 消息处理 =================
@@ -701,43 +791,49 @@ export class SConnect implements SecureChannel {
 	private handleRawMessage(data: Uint8Array): void {
 		if (this.state === "Connected") {
 			this.handleAppData(data).catch(() => {});
+			return;
+		}
+		// Idle 状态不缓存任何消息
+		if (this.state === "Idle" || data.length === 0) return;
+
+		const type = data[0];
+		const payload = data.subarray(1);
+
+		// 错误消息任何状态都处理
+		if (type === MSG_ERROR) {
+			this.handleErrorFromPeer(payload);
+			return;
+		}
+
+		// 告示消息在验证前的任何非 Idle 状态都处理（明文、未认证）
+		if (type === MSG_PREINFO) {
+			this.handlePreInfo(payload);
+			return;
+		}
+
+		// 只接受已知协议消息，未知类型直接丢弃
+		if (!KNOWN_MSG_TYPES.has(type)) return;
+
+		const handlers = this.typeMessageResolvers.get(type);
+		if (handlers) {
+			handlers.resolve(payload);
 		} else {
-			const type = data[0];
-			const payload = data.subarray(1);
+			// 每种类型只缓存最新的 1 条：一次握手中每种消息只消费一次，
+			// 陈旧/注入的同类型消息会被更新的顶替，防止灌队列
+			const stale = this.typeMessageQueue.findIndex((msg) => msg.type === type);
+			if (stale !== -1) this.typeMessageQueue.splice(stale, 1);
+			this.typeMessageQueue.push({ type, payload });
+		}
 
-			// 错误消息任何状态都处理
-			if (type === MSG_ERROR) {
-				this.handleErrorFromPeer(payload);
-				return;
-			}
-
-			// 告示消息在验证前的任何非 Idle 状态都处理（明文、未认证）
-			if (type === MSG_PREINFO && this.state !== "Idle") {
-				this.handlePreInfo(payload);
-				return;
-			}
-
-			const handlers = this.typeMessageResolvers.get(type);
-			if (handlers) {
-				handlers.resolve(payload);
-			} else {
-				this.typeMessageQueue.push({ type, payload });
-			}
-
-			switch (this.state) {
-				case "Idle":
-					return;
-
-				case "Ready":
-					switch (type) {
-						case MSG_PAIR_REQUEST:
-							this.handlePairRequest(payload);
-							break;
-						case MSG_CONNECT_REQUEST:
-							this.handleConnectRequest(payload);
-							break;
-					}
-					return;
+		// 握手进行中不派发新的配对/连接请求（限制顺序和个数）
+		if (this.state === "Ready" && !this.handshakeActive) {
+			switch (type) {
+				case MSG_PAIR_REQUEST:
+					this.handlePairRequest(payload);
+					break;
+				case MSG_CONNECT_REQUEST:
+					this.handleConnectRequest(payload);
+					break;
 			}
 		}
 	}
@@ -811,21 +907,26 @@ export class SConnect implements SecureChannel {
 			p.resolve(msg.payload);
 			return p.promise;
 		}
-		this.typeMessageResolvers.set(type, {
+		const resolver = {
 			resolve: (data: Uint8Array) => {
-				this.typeMessageResolvers.delete(type);
+				// 只清理自己的注册项，防止陈旧定时器误删新的等待者
+				if (this.typeMessageResolvers.get(type) === resolver) {
+					this.typeMessageResolvers.delete(type);
+				}
 				clearTimeout(timer);
 				p.resolve(data);
 			},
 			reject: (err: Error) => {
-				this.typeMessageResolvers.delete(type);
+				if (this.typeMessageResolvers.get(type) === resolver) {
+					this.typeMessageResolvers.delete(type);
+				}
 				clearTimeout(timer);
 				p.reject(err);
 			},
-		});
+		};
+		this.typeMessageResolvers.set(type, resolver);
 		const timer = setTimeout(() => {
-			this.typeMessageResolvers.delete(type);
-			p.reject(
+			resolver.reject(
 				new SConnectError(
 					"TIMEOUT",
 					`Timeout waiting for message type ${type}`,
@@ -854,6 +955,7 @@ export class SConnect implements SecureChannel {
 	private handleDisconnect(): void {
 		if (this.state === "Idle") return;
 		this.cipher = null;
+		this.resetHandshakeContext();
 		this.setState("Ready");
 		this.emit("disconnect");
 	}
