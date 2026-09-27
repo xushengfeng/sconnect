@@ -48,6 +48,9 @@ const KNOWN_MSG_TYPES: ReadonlySet<number> = new Set([
 	MSG_PREINFO,
 ]);
 
+// 握手消息都有界（密钥32 字节、MAC 32 字节、ID 若干），超限直接丢弃
+const MAX_HANDSHAKE_MESSAGE_SIZE = 4096;
+
 // 错误类
 class SConnectError extends Error {
 	code: ErrorCode;
@@ -86,6 +89,8 @@ type ErrorCode =
 	| "ALREADY_CONNECTED"
 	// 告示消息
 	| "PREINFO_TOO_LARGE"
+	// 消息超限
+	| "MESSAGE_TOO_LARGE"
 	// 致命错误
 	| "ADAPTER_INIT_FAILED"
 	| "CRYPTO_UNAVAILABLE";
@@ -149,11 +154,16 @@ export class SConnect implements SecureChannel {
 			pairInterval: options?.pairInterval ?? 1000,
 			connectInterval: options?.connectInterval ?? 20,
 			preInfoInterval: options?.preInfoInterval ?? 200,
+			maxMessageSize: options?.maxMessageSize ?? 1024 * 1024,
+			initialFailedPinAttempts: options?.initialFailedPinAttempts ?? 0,
+			onPinAttemptsChanged: options?.onPinAttemptsChanged ?? (() => {}),
 		};
 
 		this.pairLimiter = new Limiter(this.options.pairInterval);
 		this.connectLimiter = new Limiter(this.options.connectInterval);
 		this.preInfoLimiter = new Limiter(this.options.preInfoInterval);
+		// 支持应用层持久化后恢复 PIN 锁定状态（M5）
+		this.failedPinAttempts = this.options.initialFailedPinAttempts;
 
 		this.signalAdapter.onMessage((data) => this.handleRawMessage(data));
 		this.signalAdapter.onClose(() => this.handleDisconnect());
@@ -271,6 +281,10 @@ export class SConnect implements SecureChannel {
 		}
 
 		const dhSecret = await dh(eph.privateKey, otherPubKey);
+		if (isAllZero(dhSecret)) {
+			this.setState("Ready");
+			return { success: false, reason: "AUTH_FAILED" };
+		}
 
 		// 规范化 transcript + 双向独立密钥，两侧派生出一致的收发密钥
 		const transcript = buildConnectionTranscript(
@@ -330,21 +344,28 @@ export class SConnect implements SecureChannel {
 
 		const request: ConnectRequest = {
 			remoteDeviceId: senderId,
-			accept: (credential?: Credential) => {
+			accept: (
+				credential?: CredentialPrivateInfo,
+			): Promise<ConnectResult> => {
 				if (this.signalAdapter.trustIdentity) {
 					this.setState("Connected");
 					this.emit("ready");
 					this.sendTypeMessage(MSG_CONNECT_ACCEPT, new Uint8Array([1])).catch(
 						() => {},
 					);
-				} else {
-					if (!credential) {
-						throw new SConnectError(
-							"CREDENTIAL_INVALID",
-							"Credential is required",
-						);
-					}
+					return Promise.resolve({
+						success: true,
+						credential: this.buildCredential(credential),
+					});
 				}
+				if (!credential) {
+					throw new SConnectError(
+						"CREDENTIAL_INVALID",
+						"Credential is required",
+					);
+				}
+				// 不受信任信道必须完成凭证握手，等价于 acceptWithCre
+				return request.acceptWithCre(credential);
 			},
 			acceptWithCre: (
 				credential: CredentialPrivateInfo,
@@ -517,6 +538,10 @@ export class SConnect implements SecureChannel {
 		// 线上只出现被随机私钥盲化后的值，窃听者无法离线验证 PIN 猜测
 		const pinPoint = await hashToCurvePoint(finalPin);
 		const myBlinded = await dh(keyPair.privateKey, pinPoint);
+		// M3：拒绝退化值（小阶点/零点），防止共享秘密退化为可离线猜测
+		if (isAllZero(myBlinded)) {
+			throw new SConnectError("PAIRING_FAILED", "Degenerate PAKE value");
+		}
 		await this.sendTypeMessage(MSG_BLIND_PUBLIC_KEY, myBlinded);
 		const otherBlinded = await this.getTypeMessage(MSG_BLIND_PUBLIC_KEY);
 		if (!otherBlinded || otherBlinded.length !== 32) {
@@ -526,6 +551,12 @@ export class SConnect implements SecureChannel {
 			);
 		}
 		const s = await dh(keyPair.privateKey, otherBlinded);
+		if (isAllZero(s)) {
+			throw new SConnectError(
+				"PAIRING_FAILED",
+				"Degenerate PAKE shared secret",
+			);
+		}
 
 		// C3：先交换长期身份公钥，随后纳入 transcript 做密钥确认。
 		// 中间人替换任一公钥都会使双方 transcript 不一致，MAC 校验必然失败
@@ -578,9 +609,13 @@ export class SConnect implements SecureChannel {
 		if (!verify(otherMac, expectedMac)) {
 			// 记录失败的 PIN 尝试（MAC 校验失败意味着对方 PIN 不对或存在攻击）
 			this.failedPinAttempts++;
+			this.options.onPinAttemptsChanged(this.failedPinAttempts);
 			throw new SConnectError("PAIRING_FAILED", "Pairing verification failed");
 		}
 		this.failedPinAttempts = 0;
+		this.options.onPinAttemptsChanged(0);
+		// PIN 一次性使用：配对成功后轮换，防止同一 PIN被重复用于后续配对（M5）
+		this.PIN = "";
 
 		if (!this.signalAdapter.supportNativeEncryption) {
 			this.cipher = new cipher(iAmLow ? k1 : k2, iAmLow ? k2 : k1);
@@ -680,6 +715,7 @@ export class SConnect implements SecureChannel {
 		}
 
 		const data = new TextEncoder().encode(payload);
+		this.ensureMessageSize(data.length);
 		await this.sendData(data);
 	}
 
@@ -692,7 +728,17 @@ export class SConnect implements SecureChannel {
 		}
 
 		const buffer = data instanceof ArrayBuffer ? new Uint8Array(data) : data;
+		this.ensureMessageSize(buffer.length);
 		await this.sendData(buffer);
+	}
+
+	private ensureMessageSize(length: number): void {
+		if (length > this.options.maxMessageSize) {
+			throw new SConnectError(
+				"MESSAGE_TOO_LARGE",
+				`Message too large (${length} > ${this.options.maxMessageSize} bytes)`,
+			);
+		}
 	}
 
 	private async sendData(data: Uint8Array): Promise<void> {
@@ -790,11 +836,28 @@ export class SConnect implements SecureChannel {
 
 	private handleRawMessage(data: Uint8Array): void {
 		if (this.state === "Connected") {
+			// 应用层消息超限：GCM 计数器与消息序号绑定，静默丢弃会导致后续
+			// 解密全部失败，因此显式报错并断开（M1）
+			if (data.length > this.options.maxMessageSize) {
+				this.emit(
+					"error",
+					new SConnectError(
+						"MESSAGE_TOO_LARGE",
+						`Incoming message exceeds limit (${this.options.maxMessageSize} bytes)`,
+						false,
+					),
+				);
+				this.disconnect();
+				return;
+			}
 			this.handleAppData(data).catch(() => {});
 			return;
 		}
 		// Idle 状态不缓存任何消息
 		if (this.state === "Idle" || data.length === 0) return;
+
+		// 握手消息有界：超限直接丢弃（M1）
+		if (data.length > MAX_HANDSHAKE_MESSAGE_SIZE) return;
 
 		const type = data[0];
 		const payload = data.subarray(1);
@@ -1296,6 +1359,14 @@ function verify(key: Uint8Array, key2: Uint8Array) {
 	let diff = 0;
 	for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
 	return diff === 0;
+}
+
+// 拒绝退化 DH 结果（全零 = 小阶点/零点输入）
+function isAllZero(bytes: Uint8Array): boolean {
+	for (const b of bytes) {
+		if (b !== 0) return false;
+	}
+	return true;
 }
 
 function concatUint8Arrays(arrays: Uint8Array[]): Uint8Array {

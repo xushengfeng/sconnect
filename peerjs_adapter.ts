@@ -10,7 +10,9 @@ export class PeerjsAdapter implements UntrustedSignalingAdapter {
 
 	constructor(
 		private options?: { debug?: number },
-		public supportNativeEncryption = true,
+		// 默认 false：启用应用层加密。只有能信任传输层自带端到端加密
+		// （如 WebRTC DTLS）时才应显式传 true 跳过应用层加密
+		public supportNativeEncryption = false,
 	) {}
 
 	get trustIdentity(): false {

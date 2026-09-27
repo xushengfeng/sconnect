@@ -142,7 +142,12 @@ interface TrustedSignalingAdapter {
 /** 不受信任的信令适配器（网络信道等），需要内部 PAKE 验证，可选加密 */
 interface UntrustedSignalingAdapter {
 	trustIdentity: false;
-	/** PAKE 验证后是否启用应用层加密（如 Noise） */
+	/**
+	 * 底层传输是否已自带端到端加密（如 WebRTC DTLS）。
+	 * - false（默认，安全）：PAKE 验证后启用应用层加密；
+	 * - true：跳过应用层加密，保密性完全依赖传输层。
+	 *   仅在能信任该传输实现时才可设为 true，否则将导致无提示的明文降级。
+	 */
 	supportNativeEncryption: boolean;
 	init(myId: string): Promise<void>;
 	connect(id: string): Promise<void>;
@@ -170,8 +175,14 @@ interface ConnectRequest {
 	/** 发起方的设备 ID */
 	remoteDeviceId: string;
 	/** 发起方的显示名称（可选） */
-	/** 接受连接请求，传入本地保存的关于对方的 Credential */
-	accept: () => void;
+	/**
+	 * 接受连接请求。
+	 * - 受信任信道（trustIdentity=true）：直接建立连接。
+	 * - 不受信任信道：必须传入对方的 Credential（等价于 acceptWithCre），
+	 *   完成身份验证握手后返回结果；未传入凭证将抛出 CREDENTIAL_INVALID。
+	 */
+	accept: (credential?: CredentialPrivateInfo) => Promise<ConnectResult>;
+	/** 接受连接请求，传入本地保存的关于对方的 Credential，完成身份验证握手 */
 	acceptWithCre: (credential: CredentialPrivateInfo) => Promise<ConnectResult>;
 	/** 拒绝连接请求 */
 	reject: () => void;
@@ -193,6 +204,13 @@ interface ChannelOptions {
 	connectInterval?: number;
 	/** 告示消息（preInfo）接收间隔限制（毫秒），默认 200 */
 	preInfoInterval?: number;
+	/** 单条应用消息最大字节数（默认 1 MiB）。发送超限抛 MESSAGE_TOO_LARGE；
+	 *  接收超限视为异常，触发 error 事件并断开 */
+	maxMessageSize?: number;
+	/** 初始 PIN 失败尝试次数（应用层持久化后恢复锁定状态用），默认 0 */
+	initialFailedPinAttempts?: number;
+	/** PIN 失败尝试次数变化时回调（应用层可持久化，配合 initialFailedPinAttempts 恢复） */
+	onPinAttemptsChanged?: (failedAttempts: number) => void;
 }
 
 interface CredentialPublicInfo {
@@ -266,6 +284,14 @@ export type SecureChannelEvents = {
 	/** 收到验证前的明文告示消息（未认证，不可作为信任依据） */
 	preInfo: (text: string) => void;
 };
+
+/** 握手/通信错误（error 事件携带） */
+export interface SConnectError extends Error {
+	/** 错误码（如 PIN_INVALID / PAIRING_FAILED / MESSAGE_TOO_LARGE 等） */
+	code: string;
+	/** 是否可恢复 */
+	recoverable: boolean;
+}
 
 // ================= 状态类型 =================
 

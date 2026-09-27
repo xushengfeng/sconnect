@@ -34,7 +34,7 @@ export class LoopbackAdapterManager {
 
 export class UntrustedLoopbackAdapterManager {
 	private m = new Map<string, UntrustedLoopbackAdapter>();
-	newAdapter(supportNativeEncryption = true) {
+	newAdapter(supportNativeEncryption = false) {
 		return new UntrustedLoopbackAdapter(this, supportNativeEncryption);
 	}
 	setId(id: string, adapter: UntrustedLoopbackAdapter) {
@@ -50,7 +50,7 @@ export class UntrustedLoopbackAdapterManager {
 		b.peer = a;
 	}
 	static createPair(
-		supportNativeEncryption = true,
+		supportNativeEncryption = false,
 	): [UntrustedLoopbackAdapter, UntrustedLoopbackAdapter] {
 		const manager = new UntrustedLoopbackAdapterManager();
 		const a = new UntrustedLoopbackAdapter(manager, supportNativeEncryption);
@@ -129,7 +129,7 @@ export class UntrustedLoopbackAdapter implements UntrustedSignalingAdapter {
 
 	constructor(
 		private manager: UntrustedLoopbackAdapterManager,
-		supportNativeEncryption = true,
+		supportNativeEncryption = false,
 	) {
 		this.supportNativeEncryption = supportNativeEncryption;
 	}

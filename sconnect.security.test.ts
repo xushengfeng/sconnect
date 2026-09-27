@@ -16,7 +16,10 @@ import {
 	generateSigningKeyPair,
 	hashToCurvePoint,
 } from "./sconnect";
-import { UntrustedLoopbackAdapterManager } from "./loopback_adapter";
+import {
+	LoopbackAdapterManager,
+	UntrustedLoopbackAdapterManager,
+} from "./loopback_adapter";
 import type { ConnectRequest, PairRequest } from "./sconnect_type";
 
 const MSG_PAIR_REQUEST = 1;
@@ -406,5 +409,187 @@ describe("安全回归：失败原因与状态机 (H2/M4)", () => {
 		expect(atk.seenTypes).toContain(MSG_CONNECT_REQUEST);
 		// ……但没有消费残留的 ACCEPT 去发送公钥（否则说明陈旧消息被误用）
 		expect(atk.seenTypes).not.toContain(MSG_CONNECT_PUBLIC_KEY);
+	});
+});
+
+describe("安全回归：资源限制与 PIN 生命周期 (M1/M3/M5)", () => {
+	it("M1：发送超限必须报错，接收超限必须显式报错并断开", async () => {
+		const [adapterA, adapterB] = LoopbackAdapterManager.createPair();
+		const channelA = new SConnect(adapterA, { maxMessageSize: 65536 });
+		const channelB = new SConnect(adapterB, { maxMessageSize: 1024 });
+		await channelA.init("device-a", "device-b");
+		await channelB.init("device-b", "device-a");
+
+		const connectRequestPromise = new Promise<ConnectRequest>((resolve) => {
+			channelB.on("connectRequest", (req) => resolve(req));
+		});
+		const resultAPromise = channelA.tryConnect();
+		const connectRequest = await connectRequestPromise;
+		connectRequest.accept();
+		await resultAPromise;
+
+		// 发送端：超过自身上限直接报错
+		await expect(channelA.send("x".repeat(70000))).rejects.toMatchObject({
+			code: "MESSAGE_TOO_LARGE",
+		});
+
+		// 接收端：超过对方上限的入站消息必须显式报错并断开（不可静默丢弃）
+		const errorPromise = new Promise<{ code?: string }>((resolve) => {
+			channelB.on("error", resolve);
+		});
+		const disconnectPromise = new Promise((resolve) => {
+			channelB.on("disconnect", () => resolve(undefined));
+		});
+		await channelA.sendBinary(new Uint8Array(2048));
+		const err = await errorPromise;
+		expect(err.code).toBe("MESSAGE_TOO_LARGE");
+		await disconnectPromise;
+	});
+
+	it("M1：超大握手消息必须被丢弃", async () => {
+		const manager = new UntrustedLoopbackAdapterManager();
+		const victimAdapter = manager.newAdapter();
+		const attackerAdapter = manager.newAdapter();
+		await victimAdapter.init("device-a");
+		await attackerAdapter.init("attacker");
+		manager.connect("device-a", "attacker");
+
+		const victim = new SConnect(victimAdapter, { handshakeTimeout: 500 });
+		await victim.init("device-a", "attacker");
+
+		const atk = rawPeer(attackerAdapter);
+		(async () => {
+			await atk.wait(MSG_CONNECT_REQUEST);
+			// 超过 4096 字节的 ACCEPT 必须被丢弃，不得被当作接受处理
+			await atk.send(MSG_CONNECT_ACCEPT, new Uint8Array(8192).fill(1));
+		})();
+
+		const my = await generateSigningKeyPair();
+		const result = await victim.tryConnect({
+			createdAt: Date.now(),
+			myPrivateKey: my.privateKey,
+			myPublicKey: my.publicKey,
+			remotePublicKey: new Uint8Array(32).fill(5),
+		});
+		expect(result.success).toBe(false);
+		expect(atk.seenTypes).not.toContain(MSG_CONNECT_PUBLIC_KEY);
+	});
+
+	it("M3：全零盲化值（小阶点）必须导致配对失败", async () => {
+		const manager = new UntrustedLoopbackAdapterManager();
+		const victimAdapter = manager.newAdapter();
+		const attackerAdapter = manager.newAdapter();
+		await victimAdapter.init("victim");
+		await attackerAdapter.init("attacker");
+		manager.connect("victim", "attacker");
+
+		const victim = new SConnect(victimAdapter, { handshakeTimeout: 2000 });
+		await victim.init("victim", "attacker");
+
+		const atk = rawPeer(attackerAdapter);
+		(async () => {
+			await atk.wait(MSG_PAIR_REQUEST);
+			await atk.send(MSG_USE_YOUR_PIN);
+			await atk.wait(MSG_BLIND_PUBLIC_KEY);
+			// 小阶点/零点：共享秘密退化为全零，不得继续
+			await atk.send(MSG_BLIND_PUBLIC_KEY, new Uint8Array(32));
+		})();
+
+		const pairing = await victim.pairInit({
+			myDeviceId: "victim",
+			remoteDeviceId: "attacker",
+		});
+		await expect(pairing.waitForPairing()).rejects.toThrow();
+	});
+
+	it("M5：配对成功后 PIN 必须轮换（一次性）", async () => {
+		const [adapterA, adapterB] = UntrustedLoopbackAdapterManager.createPair();
+		const channelA = new SConnect(adapterA, { handshakeTimeout: 5000 });
+		const channelB = new SConnect(adapterB, { handshakeTimeout: 5000 });
+		await channelA.init("device-a");
+		await channelB.init("device-b");
+
+		const pairRequestPromise = new Promise<PairRequest>((resolve) => {
+			channelB.on("pairRequest", (req) => resolve(req));
+		});
+		const pairingA = await channelA.pairInit({
+			myDeviceId: "device-a",
+			remoteDeviceId: "device-b",
+		});
+		const pairRequest = await pairRequestPromise;
+		pairRequest.inputOtherPin(pairingA.pin);
+		await Promise.all([pairingA.waitForPairing(), pairRequest.waitForPairing()]);
+
+		// 断开后再次配对：PIN 必须已轮换，不得复用旧 PIN
+		channelA.disconnect();
+		const pairingA2 = await channelA.pairInit({
+			myDeviceId: "device-a",
+			remoteDeviceId: "device-b",
+		});
+		expect(pairingA2.pin).not.toBe(pairingA.pin);
+	});
+
+	it("M5：PIN 锁定状态可持久化恢复", async () => {
+		const [adapterA, adapterB] = UntrustedLoopbackAdapterManager.createPair();
+		// B 从持久化恢复了 5 次失败记录（已达上限）
+		const channelB = new SConnect(adapterB, {
+			initialFailedPinAttempts: 5,
+			maxPinAttempts: 5,
+			pairInterval: 0,
+			handshakeTimeout: 500,
+		});
+		const channelA = new SConnect(adapterA, {
+			pairInterval: 0,
+			handshakeTimeout: 500,
+		});
+		await channelA.init("device-a");
+		await channelB.init("device-b");
+
+		let dispatched = 0;
+		channelB.on("pairRequest", () => {
+			dispatched++;
+		});
+
+		const pairingA = await channelA.pairInit({
+			myDeviceId: "device-a",
+			remoteDeviceId: "device-b",
+		});
+		await new Promise((r) => setTimeout(r, 50));
+		// 锁定生效：不得派发新的配对请求
+		expect(dispatched).toBe(0);
+		await expect(pairingA.waitForPairing()).rejects.toThrow();
+	});
+
+	it("M5：失败尝试次数变化须回调（供应用层持久化）", async () => {
+		const attempts: number[] = [];
+		const [adapterA, adapterB] = UntrustedLoopbackAdapterManager.createPair();
+		const opts = {
+			pairInterval: 0,
+			maxPinAttempts: 10,
+			handshakeTimeout: 2000,
+		};
+		const channelA = new SConnect(adapterA, opts);
+		const channelB = new SConnect(adapterB, {
+			...opts,
+			onPinAttemptsChanged: (n: number) => attempts.push(n),
+		});
+		await channelA.init("device-a");
+		await channelB.init("device-b");
+
+		const pairRequestPromise = new Promise<PairRequest>((resolve) => {
+			channelB.on("pairRequest", (req) => resolve(req));
+		});
+		const pairingA = await channelA.pairInit({
+			myDeviceId: "device-a",
+			remoteDeviceId: "device-b",
+		});
+		const pairRequest = await pairRequestPromise;
+		// 两侧握手须并发启动，才能走到 MAC 校验
+		const aDone = expect(pairingA.waitForPairing()).rejects.toThrow();
+		// 输错 PIN → MAC 校验失败 → 计数 +1 并回调
+		pairRequest.inputOtherPin("000000");
+		await expect(pairRequest.waitForPairing()).rejects.toThrow();
+		await aDone;
+		expect(attempts).toContain(1);
 	});
 });
